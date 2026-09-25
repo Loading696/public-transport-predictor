@@ -14,6 +14,13 @@ Feature names used (all causal, event_time <= T):
   speed_{60,180,300,600,900,1800}s_{mean,moving_frac,le_5},
   gps_valid_300s, last_event_age_s, cur_dev_s, target_distance_km,
   planned_stops_between, telemetry_points.
+
+Roles (measured on test, late_rate=24.4%):
+  backlog     — strong_signal (P=0.46, R=0.51): the only real predictor;
+  dwell       — weak_signal   (P=0.24, R=0.19): at base rate, no signal;
+  speed_drop  — weak_signal   (P=0.25, R=0.07): at base rate, tiny support;
+  stale       — data_quality  (P=0.00, R=0.00): NOT a delay predictor, flags
+                untrustworthy telemetry. Excluded from cause_scores().
 """
 
 from __future__ import annotations
@@ -32,6 +39,17 @@ DROP_LONG_MIN_KMH = 10.0
 STALE_AGE_S = 900.0
 STALE_GPS_VALID = 0.3
 BACKLOG_S = 120.0
+
+ROLE_WEAK = "weak_signal"
+ROLE_STRONG = "strong_signal"
+ROLE_QUALITY = "data_quality"
+EVENT_ROLE = {
+    "dwell": ROLE_WEAK,
+    "speed_drop": ROLE_WEAK,
+    "backlog": ROLE_STRONG,
+    "stale": ROLE_QUALITY,
+}
+DELAY_TYPES = ("dwell", "speed_drop", "backlog")
 
 
 def _num(feat: Mapping[str, Any], key: str) -> float | None:
@@ -59,6 +77,7 @@ def detect_dwell(feat: Mapping[str, Any]) -> dict[str, Any] | None:
         confidence = _clip01((DWELL_SPEED_KMH - mean) / DWELL_SPEED_KMH * 0.7 + (DWELL_MOVE_FRAC - move) * 1.5)
         return {
             "type": "dwell",
+            "role": EVENT_ROLE["dwell"],
             "confidence": round(confidence, 3),
             "reason": f"простой: средняя скорость {mean:.1f} км/ч, доля движения {move:.2f} за 5 мин",
         }
@@ -78,6 +97,7 @@ def detect_speed_drop(feat: Mapping[str, Any]) -> dict[str, Any] | None:
         confidence = _clip01((long - short) / long)
         return {
             "type": "speed_drop",
+            "role": EVENT_ROLE["speed_drop"],
             "confidence": round(confidence, 3),
             "reason": f"просадка скорости: {short:.1f} vs {long:.1f} км/ч на длинном окне",
         }
@@ -92,6 +112,7 @@ def detect_backlog(feat: Mapping[str, Any]) -> dict[str, Any] | None:
     if cur >= BACKLOG_S:
         return {
             "type": "backlog",
+            "role": EVENT_ROLE["backlog"],
             "confidence": round(_clip01(cur / 300.0), 3),
             "reason": f"накопленное отставание {cur:.0f} с сохраняется к цели",
         }
@@ -105,12 +126,14 @@ def detect_stale(feat: Mapping[str, Any]) -> dict[str, Any] | None:
     if age is not None and age > STALE_AGE_S:
         return {
             "type": "stale",
+            "role": EVENT_ROLE["stale"],
             "confidence": round(_clip01(age / 3600.0), 3),
             "reason": f"телеметрия устарела: последнее событие {age:.0f} с назад",
         }
     if gps is not None and gps < STALE_GPS_VALID:
         return {
             "type": "stale",
+            "role": EVENT_ROLE["stale"],
             "confidence": round(_clip01(1.0 - gps / STALE_GPS_VALID), 3),
             "reason": f"потеря GPS: доля валидных координат {gps:.2f} за 5 мин",
         }
@@ -131,8 +154,14 @@ def detect_all(feat: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def cause_scores(feat: Mapping[str, Any]) -> dict[str, float]:
-    """Per-cause confidence map for the incident card. Keys are stable API."""
-    scores = {"dwell": 0.0, "speed_drop": 0.0, "backlog": 0.0, "stale": 0.0}
+    """Delay-cause confidence map (data_quality events excluded, see stale)."""
+    scores = {t: 0.0 for t in DELAY_TYPES}
     for event in detect_all(feat):
-        scores[event["type"]] = max(scores[event["type"]], float(event["confidence"]))
+        if event["type"] in scores:
+            scores[event["type"]] = max(scores[event["type"]], float(event["confidence"]))
     return scores
+
+
+def quality_flags(feat: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Data-quality events (role == data_quality): stale telemetry, not delays."""
+    return [e for e in detect_all(feat) if e.get("role") == ROLE_QUALITY]

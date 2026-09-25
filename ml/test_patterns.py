@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.patterns import cause_scores, detect_all  # noqa: E402
+from src.patterns import cause_scores, detect_all, quality_flags  # noqa: E402
 
 FREE_FLOW = {
     "speed_300s_mean": 28.0, "speed_300s_moving_frac": 0.95,
@@ -58,8 +58,9 @@ GARBAGE = {"speed_300s_mean": float("nan"), "cur_dev_s": "oops"}
 
 def _check_contract(events: list[dict]) -> None:
     for event in events:
-        assert set(event) == {"type", "confidence", "reason"}, event
+        assert set(event) == {"type", "role", "confidence", "reason"}, event
         assert event["type"] in {"dwell", "speed_drop", "backlog", "stale"}, event
+        assert event["role"] in {"weak_signal", "strong_signal", "data_quality"}, event
         assert 0.0 <= event["confidence"] <= 1.0, event
         assert isinstance(event["reason"], str) and event["reason"], event
 
@@ -81,7 +82,11 @@ def main() -> None:
     for case in (FREE_FLOW, STANDSTILL, COLLAPSE, BACKLOG, STALE_AGE, STALE_GPS, BOUNDARY, {}, GARBAGE):
         _check_contract(detect_all(case))
     scores = cause_scores(STANDSTILL)
-    assert set(scores) == {"dwell", "speed_drop", "backlog", "stale"}, scores
+    assert set(scores) == {"dwell", "speed_drop", "backlog"}, scores
+    assert all(t != "stale" for t in scores)
+    flags = quality_flags(STALE_AGE)
+    assert flags and all(e["role"] == "data_quality" for e in flags), flags
+    assert quality_flags(FREE_FLOW) == []
     print("ALL PATTERN TESTS PASSED")
 
 
