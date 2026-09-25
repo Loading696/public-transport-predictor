@@ -58,6 +58,40 @@ def format_delay(seconds: object | None) -> str:
     return f"{delay:+.0f} с ({delay / 60.0:+.1f} мин)"
 
 
+def format_risk(value: object | None) -> str:
+    return str(value) if value else "—"
+
+
+def format_pct(value: object | None) -> str:
+    """Вероятность p_late процентами; без калибровки — прочерк."""
+    prob = finite_number(value)
+    if prob is None:
+        return "—"
+    return f"{prob * 100.0:.0f}%"
+
+
+def pattern_events_of(item: dict | None) -> list:
+    """События паттернов Person A из записи или её снапшота (терпимо к отсутствию)."""
+    if not isinstance(item, dict):
+        return []
+    events = item.get("pattern_events")
+    if not events and isinstance(item.get("snapshot"), dict):
+        events = item["snapshot"].get("pattern_events")
+    return events if isinstance(events, list) else []
+
+
+def render_pattern_events(events: list) -> None:
+    """Строки вида «dwell (65%): причина» — типы generic по контракту A."""
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        ptype = str(event.get("type", "—"))
+        conf = finite_number(event.get("confidence"))
+        conf_text = f"{conf * 100.0:.0f}%" if conf is not None else "—"
+        reason = str(event.get("reason", "—"))
+        st.markdown(f"**Паттерн {html.escape(ptype)} ({html.escape(conf_text)}):** {html.escape(reason)}")
+
+
 def door_badge(value: object | None) -> str:
     """Бейдж статуса дверей из live-потока (Crown03/Irma04)."""
     if value is True:
@@ -228,6 +262,8 @@ def render_incident(incident: dict | None) -> None:
         )
     st.markdown(f"**Текущая позиция:** {html.escape(position_text)}")
     st.markdown(f"**Рекомендация:** {html.escape(str(incident.get('recommendation', '—')))}")
+    st.markdown(f"**P(опоздание > 120с):** {html.escape(format_pct(incident.get('p_late')))}")
+    render_pattern_events(pattern_events_of(incident))
 
 
 try:
@@ -348,17 +384,23 @@ with tab_replay:
     else:
         table = pd.DataFrame(vehicles)
         table["prediction_s"] = table["prediction"].round(1)
+        table["risk"] = table["risk"].map(format_risk)
+        if "p_late" in table.columns:
+            table["p_late_pct"] = table["p_late"].map(format_pct)
+        risk_cols = ["tr_id", "prediction_s", "target_class", "risk", "target_time_begin", "recommendation"]
+        risk_rename = {
+            "tr_id": "ТС",
+            "prediction_s": "Задержка, с",
+            "target_class": "Класс",
+            "risk": "Риск",
+            "target_time_begin": "Плановое прибытие",
+            "recommendation": "Рекомендация",
+        }
+        if "p_late_pct" in table.columns:
+            risk_cols.insert(2, "p_late_pct")
+            risk_rename["p_late_pct"] = "P(>120с)"
         st.dataframe(
-            table[["tr_id", "prediction_s", "target_class", "risk", "target_time_begin", "recommendation"]].rename(
-                columns={
-                    "tr_id": "ТС",
-                    "prediction_s": "Задержка, с",
-                    "target_class": "Класс",
-                    "risk": "Риск",
-                    "target_time_begin": "Плановое прибытие",
-                    "recommendation": "Рекомендация",
-                }
-            ),
+            table[risk_cols].rename(columns=risk_rename),
             hide_index=True,
             use_container_width=True,
         )
@@ -367,16 +409,18 @@ with tab_replay:
         for vehicle in vehicles:
             risk = vehicle.get("risk", "on-time")
             color = colors.get(risk, "#f3f4f6")
-            label = labels.get(risk, risk)
-            delay = float(vehicle.get("prediction", 0.0))
+            label = labels.get(risk, format_risk(risk))
+            delay = finite_number(vehicle.get("prediction")) or 0.0
             target = html.escape(str(vehicle.get("target_time_begin", "—")))
             recommendation = html.escape(str(vehicle.get("recommendation", "—")))
             st.markdown(
                 f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
                 f'<b>ТС {html.escape(str(vehicle.get("tr_id")))}</b> · {delay:.1f} с · {label} · '
+                f'P(>120с) {html.escape(format_pct(vehicle.get("p_late")))} · '
                 f'цель {target}<br>{recommendation}</div>',
                 unsafe_allow_html=True,
             )
+            render_pattern_events(pattern_events_of(vehicle))
 
 with tab_live:
     st.subheader("Живой поток NDTP")
@@ -399,8 +443,9 @@ with tab_live:
                     "Двери": door_badge(unit.get("door_open")),
                     "Скорость, км/ч": unit.get("speed"),
                     "Прогноз": forecast,
+                    "P(>120с)": format_pct(unit.get("p_late")),
                     "Подсказка": "без подсказки" if unit.get("cur_dev_hint") == "none" else "—",
-                    "Риск": unit.get("risk", "—"),
+                    "Риск": format_risk(unit.get("risk")),
                     "Цель (остановка)": unit.get("target_stop_id", "—"),
                     "Плановое прибытие": short_time(unit.get("target_time_begin")),
                     "Возраст, с": round(float(unit["age_s"]), 1) if finite_number(unit.get("age_s")) is not None else "—",
@@ -417,12 +462,14 @@ with tab_live:
                 f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
                 f'<b>Юнит {html.escape(str(unit.get("unit_id")))} → ТС {html.escape(str(unit.get("tr_id")))}</b> · '
                 f'{html.escape(badge)} · прогноз {html.escape(format_delay(unit.get("prediction")))}{html.escape(hint)} · '
-                f'риск {html.escape(str(unit.get("risk", "—")))} · '
+                f'P(>120с) {html.escape(format_pct(unit.get("p_late")))} · '
+                f'риск {html.escape(format_risk(unit.get("risk")))} · '
                 f'цель {html.escape(str(unit.get("target_stop_id", "—")))} '
                 f'({html.escape(short_time(unit.get("target_time_begin")))})<br>'
                 f'{html.escape(str(unit.get("recommendation", "—")))}{note}</div>',
                 unsafe_allow_html=True,
             )
+            render_pattern_events(pattern_events_of(unit))
     st.subheader("Карта живых юнитов")
     render_network([], [], {}, map_live)
 

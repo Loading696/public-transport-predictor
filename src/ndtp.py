@@ -13,6 +13,9 @@ Implements the framing from dataset/docs/Emulator-and-Telematic-Packets-Specific
 
 Only the navigation cell is decoded into telemetry rows; other known cells
 are carried as raw payload, unknown cell types stop cell parsing.
+Door cells Crown03 (type 3) / Irma04 (type 4) are decoded best-effort into
+door_open (ASSUMPTION, verified=False — binary layouts are NOT in the spec,
+see the comment block above CELL_CROWN03).
 """
 
 from __future__ import annotations
@@ -34,14 +37,22 @@ TYPE_REALTIME = 101
 CELL_NAV00 = 0
 NAV00_PAYLOAD = 26
 
-# Ячейки дверей (см. dataset/docs/Emulator-and-Telematic-Packets-Specification.md).
-# Суффикс в имени = номер типа ячейки в realtime-потоке, размер payload фиксирован:
-#   Crown03 (type 3, 3 байта): [door_mask u8][open_count u8][flags u8]
-#     door_mask: битовая маска дверей (бит=1 — дверь открыта), 0 = все закрыты.
-#   Irma04 (type 4, 4 байта): [door_mask u8][in_count u8][out_count u8][flags u8]
-#     door_mask: та же битовая маска; in/out — счётчики пассажиров IRMA.
-# door_open для строки буфера = (door_mask != 0) по любой из ячеек; если ячеек
-# дверей нет в пакете — None (неизвестно), чтобы не путать с "закрыты".
+# Ячейки дверей (имена полей конфига эмулятора — из §6.7 спеки, дословно).
+# ВНИМАНИЕ (ASSUMPTION): бинарных layout'ов Crown03/Irma04 в спеке НЕТ.
+# Известны только: номера типов (3 = Crown/Corona, 4 = Irma — подтверждены
+# примером cells[] из §6.7) и семантика полей эмулятора:
+#   type 4 (Irma): odometer, zone, irma_door_in1..4/out1..4,
+#                  irma_present_door1..4, irma_closed_door1..4;
+#   type 3 (Crown/Corona): odometer, zone, corona_door_in1..4/out1..4.
+# В этих полях НЕТ door_mask — маска в декодере ниже НЕ подтверждена спекой.
+# Фиксированные размеры CROWN03_PAYLOAD/IRMA04_PAYLOAD — тоже предположение
+# (оставлено сознательно: детерминированный фрейминг + обе ячейки из одного
+# пакета декодятся раздельно; длины напрямую видны в живом захвате).
+# Каждый декод помечен verified=False и несёт raw-hex: живой прогон с явными
+# cells (дверь 1 открыта: closed_door1=0, счётчики ненулевые) обязан показать
+# door_open=True, полностью закрытый конфиг — False; иначе layout'ы править.
+# door_open для строки буфера = эвристика по первому байту (НЕ подтверждена);
+# если ячеек дверей в пакете нет — None (неизвестно), не путать с "закрыты".
 CELL_CROWN03 = 3
 CROWN03_PAYLOAD = 3
 CELL_IRMA04 = 4
@@ -154,7 +165,7 @@ def decode_nav00(payload: bytes) -> dict:
 
 
 def decode_crown03(payload: bytes) -> dict:
-    """Разбор ячейки дверей Crown03 (3 байта)."""
+    """Разбор ячейки дверей Crown03 (3 байта, ASSUMPTION — см. шапку модуля)."""
     if len(payload) != CROWN03_PAYLOAD:
         raise NDTPError(f"Crown03 payload must be {CROWN03_PAYLOAD} bytes, got {len(payload)}")
     door_mask, open_count, flags = payload[0], payload[1], payload[2]
@@ -165,11 +176,13 @@ def decode_crown03(payload: bytes) -> dict:
         "open_count": int(open_count),
         "flags": int(flags),
         "door_open": bool(door_mask != 0),
+        "verified": False,
+        "raw": bytes(payload).hex(),
     }
 
 
 def decode_irma04(payload: bytes) -> dict:
-    """Разбор ячейки дверей/счётчика Irma04 (4 байта)."""
+    """Разбор ячейки дверей/счётчика Irma04 (4 байта, ASSUMPTION — см. шапку модуля)."""
     if len(payload) != IRMA04_PAYLOAD:
         raise NDTPError(f"Irma04 payload must be {IRMA04_PAYLOAD} bytes, got {len(payload)}")
     door_mask, in_count, out_count, flags = payload[0], payload[1], payload[2], payload[3]
@@ -181,6 +194,8 @@ def decode_irma04(payload: bytes) -> dict:
         "out_count": int(out_count),
         "flags": int(flags),
         "door_open": bool(door_mask != 0),
+        "verified": False,
+        "raw": bytes(payload).hex(),
     }
 
 
