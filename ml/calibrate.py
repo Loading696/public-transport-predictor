@@ -50,7 +50,7 @@ def main() -> None:
         test_labels, dataset / "test" / "traffic.csv", dataset / "test" / "schedule.csv"
     )
     log("[cal 2/4] training regressor...")
-    model, features = train_model(train_frame, test_frame)
+    model, features = train_model(train_frame)
     log("[cal 3/4] fitting isotonic P(late | prediction)...")
     test_pred = np.asarray(predict(model, test_frame, features), dtype=float)
     is_late = (test_labels["target_delay_s"].to_numpy(dtype=float) > LATE_THRESHOLD_S).astype(int)

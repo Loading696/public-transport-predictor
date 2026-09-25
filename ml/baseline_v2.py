@@ -49,7 +49,7 @@ def main() -> None:
     log(f"[v2] test_frame: {test_frame.shape}")
 
     log("[v2 3/5] training CatBoost on train...")
-    model, features = train_model(train_frame, test_frame)
+    model, features = train_model(train_frame)
     log(f"[v2] n_features={len(features)}")
 
     pred_test = predict(model, test_frame, features)
@@ -59,7 +59,7 @@ def main() -> None:
 
     log("[v2 4/5] refit on train+test for final submission...")
     full_frame = pd.concat([train_frame, test_frame], ignore_index=True)
-    model_full, features_full = train_model(full_frame, test_frame)
+    model_full, features_full = train_model(full_frame)
     assert features_full == features, "feature list changed after refit"
 
     log("[v2 5/5] building validate features + predicting...")

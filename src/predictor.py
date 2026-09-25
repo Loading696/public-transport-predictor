@@ -380,12 +380,15 @@ def select_feature_columns(frame: pd.DataFrame) -> list[str]:
 
 def train_model(
     train_frame: pd.DataFrame,
-    valid_frame: pd.DataFrame,
     *,
     use_vehicle_category: bool = True,
     iterations: int = 700,
 ) -> tuple[CatBoostRegressor, list[str]]:
-    """Fit a robust CatBoost regressor and return it with its feature list."""
+    """Fit a robust CatBoost regressor and return it with its feature list.
+
+    Fixed iteration budget, no eval set: pass a pre-split frame if you need
+    honest holdout metrics (see callers), the model itself never sees it.
+    """
     features = select_feature_columns(train_frame)
     cat_features = ["tr_id"] if use_vehicle_category else []
     model = CatBoostRegressor(
@@ -433,7 +436,7 @@ def main() -> None:
     test_frame = build_features(test_labels, root / "test" / "traffic.csv", root / "test" / "schedule.csv")
     print("building validate features", flush=True)
     validate_frame = build_features(validate_points, root / "validate" / "traffic.csv", root / "validate" / "schedule_plan.csv")
-    model, features = train_model(train_frame, test_frame)
+    model, features = train_model(train_frame)
     pred_test = predict(model, test_frame, features)
     print(f"test MAE: {mean_absolute_error(test_labels['target_delay_s'], pred_test):.3f}")
     print(f"baseline MAE: {mean_absolute_error(test_labels['target_delay_s'], test_labels['cur_dev_s']):.3f}")
