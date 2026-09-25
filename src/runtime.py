@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
 
-from src.predictor import build_features_from_frames
+from src.predictor import build_features_from_frames, haversine_km, parse_point_wkt
 from src.predictor import predict as model_predict
 
 TELEMETRY_COLUMNS = [
@@ -61,6 +61,61 @@ def recommendation_for(delay_s: float) -> str:
     if delay_s > 0.0:
         return "контролировать движение ТС"
     return "наблюдение без вмешательства"
+
+
+RISK_COLORS = {"on-time": "#22c55e", "at-risk": "#eab308", "late": "#ef4444"}
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _latest_position(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    for row in reversed(list(rows)):
+        if not bool(row.get("location_valid", False)):
+            continue
+        lon = _finite_float(row.get("lon"))
+        lat = _finite_float(row.get("lat"))
+        if lon is None or lat is None:
+            continue
+        return {
+            "lon": lon,
+            "lat": lat,
+            "event_time": _json_value(row.get("event_time")),
+            "speed": _json_value(row.get("speed")),
+            "heading": _json_value(row.get("heading")),
+        }
+    return None
+
+
+def _route_network(schedule: pd.DataFrame) -> dict[int, dict[str, Any]]:
+    frame = schedule.copy()
+    frame["time_begin"] = pd.to_datetime(frame["time_begin"], errors="coerce")
+    frame["tr_id"] = pd.to_numeric(frame["tr_id"], errors="coerce")
+    frame = frame.dropna(subset=["tr_id"]).copy()
+    frame["tr_id"] = frame["tr_id"].astype(int)
+    parsed = frame["geom"].map(parse_point_wkt)
+    frame["lon"] = [value[0] for value in parsed]
+    frame["lat"] = [value[1] for value in parsed]
+    frame = frame.sort_values(["tr_id", "time_begin", "tt_action_item_id"], kind="stable")
+    routes: dict[int, dict[str, Any]] = {}
+    for vehicle_id, group in frame.groupby("tr_id", sort=False):
+        stops = [
+            {
+                "stop_id": _json_value(row.get("tt_action_item_id")),
+                "time": _json_value(row.get("time_begin")),
+                "address": _json_value(row.get("building_address")),
+                "lon": _json_value(row.get("lon")),
+                "lat": _json_value(row.get("lat")),
+            }
+            for _, row in group.iterrows()
+        ]
+        routes[int(vehicle_id)] = {"tr_id": int(vehicle_id), "stops": stops}
+    return routes
 
 
 def _empty_traffic() -> pd.DataFrame:
@@ -259,6 +314,9 @@ class StreamSimulator:
         self._traffic_rows = self.traffic[TELEMETRY_COLUMNS].to_dict("records")
         self._point_rows = self.points.drop(columns=["T_dt", "_point_order"], errors="ignore").to_dict("records")
         self._vehicles: dict[int, dict[str, Any]] = {}
+        self._vehicle_telemetry: dict[int, list[dict[str, Any]]] = {}
+        self._visible_traffic: list[dict[str, Any]] = []
+        self._routes = _route_network(service.schedule)
         self.speed = self._safe_speed(speed)
         self._reset_state()
         self._stop_event = asyncio.Event()
@@ -274,10 +332,22 @@ class StreamSimulator:
     def set_speed(self, speed: float) -> None:
         self.speed = self._safe_speed(speed)
 
+    def _remember_telemetry(self, row: dict[str, Any]) -> None:
+        self._visible_traffic.append(row)
+        raw_vehicle_id = row.get("tr_id")
+        if raw_vehicle_id is None:
+            return
+        try:
+            vehicle_id = int(raw_vehicle_id)
+        except (TypeError, ValueError):
+            return
+        self._vehicle_telemetry.setdefault(vehicle_id, []).append(row)
+
     def _reset_state(self) -> None:
         self._traffic_position = 0
         self._point_position = 0
         self._visible_traffic = []
+        self._vehicle_telemetry = {}
         self._vehicles = {}
         point_times = [value for value in self.points["T_dt"].tolist() if pd.notna(value)]
         traffic_times = [value for value in self.traffic["event_time"].tolist() if pd.notna(value)]
@@ -287,7 +357,7 @@ class StreamSimulator:
             event_time = pd.Timestamp(self._traffic_rows[self._traffic_position]["event_time"])
             if event_time > self.current_time:
                 break
-            self._visible_traffic.append(self._traffic_rows[self._traffic_position])
+            self._remember_telemetry(self._traffic_rows[self._traffic_position])
             self._traffic_position += 1
         self.finished = False
 
@@ -318,13 +388,142 @@ class StreamSimulator:
             previous_wall = current_wall
             self.advance_to(self.current_time + pd.Timedelta(seconds=elapsed * self.speed))
 
+    def _causal_history(self, vehicle_id: int, forecast_time: pd.Timestamp) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in self._vehicle_telemetry.get(vehicle_id, [])
+            if pd.Timestamp(row.get("event_time")) <= forecast_time
+        ]
+
+    def _vehicle_schedule(self, vehicle_id: int) -> pd.DataFrame:
+        schedule = self.service.schedule.copy()
+        schedule["tr_id"] = pd.to_numeric(schedule["tr_id"], errors="coerce")
+        schedule = schedule[schedule["tr_id"] == vehicle_id].copy()
+        schedule["time_begin"] = pd.to_datetime(schedule["time_begin"], errors="coerce")
+        parsed = schedule["geom"].map(parse_point_wkt)
+        schedule["lon"] = [value[0] for value in parsed]
+        schedule["lat"] = [value[1] for value in parsed]
+        return schedule.sort_values(["time_begin", "tt_action_item_id"], kind="stable")
+
+    @staticmethod
+    def _stop_card(row: pd.Series | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "stop_id": _json_value(row.get("tt_action_item_id")),
+            "time": _json_value(row.get("time_begin")),
+            "address": _json_value(row.get("building_address")),
+            "lon": _json_value(row.get("lon")),
+            "lat": _json_value(row.get("lat")),
+        }
+
+    def _snapshot_for_point(self, point: dict[str, Any]) -> dict[str, Any]:
+        vehicle_id = int(point["tr_id"])
+        forecast_time = pd.Timestamp(point["T"])
+        target_id = int(point["target_stop_id"])
+        target_time = pd.Timestamp(point["target_time_begin"])
+        current_deviation = float(point["cur_dev_s"])
+        history = self._causal_history(vehicle_id, forecast_time)
+        position = _latest_position(history)
+        last_time = pd.Timestamp(history[-1]["event_time"]) if history else None
+        last_age = float((forecast_time - last_time).total_seconds()) if last_time is not None else None
+        window_start = forecast_time - pd.Timedelta(seconds=600)
+        window_speeds = [
+            speed
+            for row in history
+            if pd.Timestamp(row.get("event_time")) >= window_start
+            for speed in [_finite_float(row.get("speed"))]
+            if speed is not None
+        ]
+        average_speed = float(sum(window_speeds) / len(window_speeds)) if window_speeds else None
+        schedule = self._vehicle_schedule(vehicle_id)
+        target_row = schedule[pd.to_numeric(schedule["tt_action_item_id"], errors="coerce") == target_id]
+        target = self._stop_card(target_row.iloc[0] if not target_row.empty else None)
+        target_lon = _finite_float(target.get("lon")) if target else None
+        target_lat = _finite_float(target.get("lat")) if target else None
+        distance = None
+        if position and target_lon is not None and target_lat is not None:
+            distance = float(haversine_km([position["lon"]], [position["lat"]], target_lon, target_lat)[0])
+        remaining = schedule[(schedule["time_begin"] > forecast_time) & (schedule["time_begin"] <= target_time)]
+        gaps = pd.to_numeric(remaining["time_begin"].diff().dt.total_seconds(), errors="coerce").dropna()
+        previous = schedule[schedule["time_begin"] <= forecast_time].tail(1)
+        following = schedule[schedule["time_begin"] > forecast_time].head(1)
+        target_previous = schedule[schedule["time_begin"] < target_time].tail(1)
+        if not history:
+            cause = "телеметрия отсутствует: прогноз опирается на плановое расписание и последнее известное отклонение"
+        elif position is None:
+            cause = "нет достоверных координат: траекторию и причину по движению определить нельзя"
+        elif last_age is not None and last_age > 900:
+            cause = "телеметрия устарела: последнее событие значительно старше момента прогноза"
+        elif average_speed is not None and average_speed <= 5.0:
+            cause = "низкая скорость или простой перед целевым участком"
+        elif average_speed is not None and average_speed <= 12.0:
+            cause = "замедленное движение на подходе к целевой остановке"
+        elif current_deviation >= 120.0:
+            cause = "накопленное отставание от графика сохраняется к целевой остановке"
+        elif len(remaining) >= 3:
+            cause = "плотный плановый участок: несколько остановок между прогнозом и целью"
+        else:
+            cause = "отклонение операционного режима от планового графика"
+        return {
+            "forecast_time": _json_value(forecast_time),
+            "target": target,
+            "target_time": _json_value(target_time),
+            "current_deviation_s": current_deviation,
+            "position": position,
+            "last_event_age_s": last_age,
+            "telemetry_points": float(len(history)),
+            "average_speed_10m_kmh": average_speed,
+            "distance_to_target_km": distance,
+            "planned_stops_remaining": len(remaining),
+            "remaining_gap_mean_s": float(gaps.mean()) if not gaps.empty else None,
+            "current_segment": {
+                "previous": self._stop_card(previous.iloc[0] if not previous.empty else None),
+                "next": self._stop_card(following.iloc[0] if not following.empty else None),
+            },
+            "target_segment": {
+                "previous": self._stop_card(target_previous.iloc[0] if not target_previous.empty else None),
+                "target": target,
+            },
+            "cause": cause,
+        }
+
+    def _select_incident(self) -> dict[str, Any] | None:
+        candidates = [
+            record
+            for record in self._vehicles.values()
+            if isinstance(record.get("snapshot"), dict) and float(record.get("prediction", 0.0)) >= 60.0
+        ]
+        if not candidates:
+            return None
+        record = max(candidates, key=lambda item: float(item.get("prediction", 0.0)))
+        snapshot = record["snapshot"]
+        vehicle_id = int(record["tr_id"])
+        target_time = pd.Timestamp(record["target_time_begin"])
+        prediction = float(record["prediction"])
+        arrival = target_time + pd.Timedelta(seconds=prediction) if pd.notna(target_time) else None
+        return {
+            "tr_id": vehicle_id,
+            "sample_id": record.get("sample_id"),
+            "forecast_time": record.get("T"),
+            "target_stop_id": record.get("target_stop_id"),
+            "target_time": record.get("target_time_begin"),
+            "predicted_delay_s": prediction,
+            "predicted_arrival": _json_value(arrival),
+            "risk": record.get("risk"),
+            "recommendation": record.get("recommendation"),
+            "cause": snapshot.get("cause"),
+            "position_now": _latest_position(self._vehicle_telemetry.get(vehicle_id, [])),
+            "snapshot": snapshot,
+        }
+
     def advance_to(self, target_time: pd.Timestamp) -> None:
         target = pd.Timestamp(target_time)
         while self._traffic_position < len(self._traffic_rows):
             event_time = pd.Timestamp(self._traffic_rows[self._traffic_position]["event_time"])
             if event_time > target:
                 break
-            self._visible_traffic.append(self._traffic_rows[self._traffic_position])
+            self._remember_telemetry(self._traffic_rows[self._traffic_position])
             self._traffic_position += 1
         while self._point_position < len(self._point_rows):
             point = self._point_rows[self._point_position]
@@ -334,6 +533,7 @@ class StreamSimulator:
             result = self.service.predict_frame([point], pd.DataFrame(self._visible_traffic))
             if not result.empty:
                 record = _record_for_response(result.iloc[0])
+                record["snapshot"] = self._snapshot_for_point(point)
                 self._vehicles[int(record["tr_id"])] = record
             self._point_position += 1
         if self._traffic_position >= len(self._traffic_rows) and self._point_position >= len(self._point_rows):
@@ -350,6 +550,29 @@ class StreamSimulator:
         next_point = None
         if self._point_position < len(self._point_rows):
             next_point = _json_value(self._point_rows[self._point_position]["T"])
+        active_routes = []
+        active_positions = []
+        for vehicle_id in sorted(self._vehicles):
+            route = self._routes.get(vehicle_id)
+            risk = str(self._vehicles[vehicle_id].get("risk", "on-time"))
+            if route is not None:
+                polyline = [
+                    [stop["lat"], stop["lon"]]
+                    for stop in route["stops"]
+                    if isinstance(stop.get("lat"), (int, float)) and isinstance(stop.get("lon"), (int, float))
+                ]
+                active_routes.append(
+                    {
+                        "tr_id": vehicle_id,
+                        "risk": risk,
+                        "color": RISK_COLORS.get(risk, "#9ca3af"),
+                        "stops": route["stops"],
+                        "polyline": polyline,
+                    }
+                )
+            position = _latest_position(self._vehicle_telemetry.get(vehicle_id, []))
+            if position is not None:
+                active_positions.append({"tr_id": vehicle_id, "risk": risk, **position})
         return {
             "simulated_time": _json_value(self.current_time),
             "speed": self.speed,
@@ -362,4 +585,9 @@ class StreamSimulator:
             "next_point_time": next_point,
             "vehicles": vehicles,
             "predictions": vehicles,
+            "map": {
+                "routes": active_routes,
+                "positions": active_positions,
+                "incident": self._select_incident(),
+            },
         }
