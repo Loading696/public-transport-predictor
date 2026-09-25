@@ -234,6 +234,73 @@ columns[1].metric("Скорость", f"x{status_data.get('speed', speed)}")
 columns[2].metric("Обработано точек", f"{status_data.get('processed_points', 0)} / {status_data.get('total_points', 0)}")
 columns[3].metric("ТС в прогнозе", len(vehicles))
 
+st.subheader("Табло расписания")
+sim_time = str(status_data.get("simulated_time") or "")
+veh_ids = sorted(vehicles_by_id.keys())
+if not veh_ids:
+    st.info("Нет активных ТС: прогнозы появятся после достижения симулятором времени T.")
+else:
+    selected = st.selectbox("ТС", veh_ids, key="schedule_vehicle")
+    vehicle = vehicles_by_id.get(selected, {})
+    target_id = str(vehicle.get("target_stop_id", ""))
+    prediction = finite_number(vehicle.get("prediction"))
+    route = next((item for item in routes if item.get("tr_id") == selected), None)
+    stops = route.get("stops", []) if route else []
+    timeline = []
+    next_marked = False
+    for stop in stops:
+        stop_time = str(stop.get("time") or "")
+        if stop_time and sim_time and stop_time <= sim_time:
+            status = "время прошло"
+        elif not next_marked:
+            status = "следующая"
+            next_marked = True
+        else:
+            status = "по плану"
+        is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
+        timeline.append(
+            {
+                "Время": short_time(stop.get("time")),
+                "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
+                "Статус": ("ЦЕЛЬ ПРОГНОЗА · " if is_target else "") + status,
+                "Прогноз": format_delay(prediction) if is_target else "—",
+            }
+        )
+    if timeline:
+        st.dataframe(pd.DataFrame(timeline), hide_index=True, use_container_width=True)
+    else:
+        st.info("Расписание этого ТС недоступно.")
+
+    st.subheader("Ближайшие прибытия")
+    upcoming = []
+    for route in routes:
+        vehicle = vehicles_by_id.get(route.get("tr_id"), {})
+        target_id = str(vehicle.get("target_stop_id", ""))
+        prediction = finite_number(vehicle.get("prediction"))
+        for stop in route.get("stops", []):
+            stop_time = str(stop.get("time") or "")
+            if sim_time and stop_time and stop_time > sim_time:
+                is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
+                upcoming.append(
+                    {
+                        "sort": stop_time,
+                        "Время": short_time(stop.get("time")),
+                        "ТС": route.get("tr_id"),
+                        "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
+                        "Прогноз": format_delay(prediction) if is_target else "—",
+                    }
+                )
+                break
+    upcoming = sorted(upcoming, key=lambda row: row["sort"])[:15]
+    if upcoming:
+        st.dataframe(
+            pd.DataFrame(upcoming).drop(columns=["sort"]),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("Предстоящих прибытий в расписании нет.")
+
 st.subheader("Маршрутная сеть и позиции ТС")
 render_network(routes, positions, vehicles_by_id, live_units)
 
