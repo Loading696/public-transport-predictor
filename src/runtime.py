@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from bisect import bisect_right
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from catboost import CatBoostRegressor
 
 from src.predictor import build_features_from_frames, haversine_km, parse_point_wkt
 from src.predictor import predict as model_predict
+from src.patterns import detect_all
 
 TELEMETRY_COLUMNS = [
     "tr_id",
@@ -197,6 +199,8 @@ def _record_for_response(row: pd.Series) -> dict[str, Any]:
         "target_class": str(row["target_class"]),
         "risk": str(row["risk"]),
         "recommendation": str(row["recommendation"]),
+        "p_late": _json_value(row.get("p_late")),
+        "pattern_events": row.get("pattern_events") if isinstance(row.get("pattern_events"), list) else [],
     }
 
 
@@ -225,6 +229,7 @@ class InferenceService:
         self.features = json.loads(self.features_path.read_text(encoding="utf-8"))
         if not isinstance(self.features, list) or not self.features:
             raise ValueError(f"invalid feature list: {self.features_path}")
+        self.prob_cal = self._load_prob_cal(self.root / "ml" / "prob_cal.json")
 
     def _path(self, value: str | Path) -> Path:
         path = Path(value)
@@ -233,6 +238,33 @@ class InferenceService:
     @staticmethod
     def _read_csv(path: Path) -> pd.DataFrame:
         return pd.read_csv(path, low_memory=False)
+
+    @staticmethod
+    def _load_prob_cal(path: Path) -> tuple[list[float], list[float]] | None:
+        """Stepwise isotonic curve P(late | prediction); None when unavailable."""
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            xs = [float(v) for v in payload.get("X", [])]
+            ps = [float(v) for v in payload.get("p", [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        if len(xs) != len(ps) or not xs:
+            return None
+        return xs, ps
+
+    def p_late_for(self, delay_s: float) -> float | None:
+        """Calibrated P(delay > 120s) for a point prediction; None without curve."""
+        if self.prob_cal is None:
+            return None
+        try:
+            value = float(delay_s)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        xs, ps = self.prob_cal
+        idx = max(0, min(bisect_right(xs, value) - 1, len(ps) - 1))
+        return float(ps[idx])
 
     def predict_frame(
         self,
@@ -260,6 +292,18 @@ class InferenceService:
         result["target_class"] = [target_class_for(float(value)) for value in values]
         result["risk"] = [risk_for(float(value)) for value in values]
         result["recommendation"] = [recommendation_for(float(value)) for value in values]
+        result["p_late"] = [self.p_late_for(float(value)) for value in values]
+        pattern_events: list[list[dict[str, Any]]] = []
+        for pos in range(len(result)):
+            if pos < len(features_frame):
+                try:
+                    events = detect_all(features_frame.iloc[pos].to_dict())
+                except Exception:  # noqa: BLE001 - detectors must stay total
+                    events = []
+            else:
+                events = []
+            pattern_events.append(events)
+        result["pattern_events"] = pattern_events
         return result
 
     def predict_records(
