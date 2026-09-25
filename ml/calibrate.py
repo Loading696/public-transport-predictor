@@ -55,13 +55,15 @@ def main() -> None:
     test_pred = np.asarray(predict(model, test_frame, features), dtype=float)
     is_late = (test_labels["target_delay_s"].to_numpy(dtype=float) > LATE_THRESHOLD_S).astype(int)
     iso = IsotonicRegression(out_of_bounds="clip")
-    proba = iso.fit_transform(test_pred, is_late)
+    proba = np.asarray(iso.fit_transform(test_pred, is_late), dtype=float)
     brier = float(brier_score_loss(is_late, proba))
+    thresholds = np.asarray(iso.X_thresholds_, dtype=float)
+    curve = np.asarray(iso.predict(thresholds), dtype=float)
     payload = {
         "kind": "isotonic",
         "late_threshold_s": LATE_THRESHOLD_S,
-        "X": [float(v) for v in iso.X_thresholds_],
-        "p": [float(v) for v in iso.f_],
+        "X": [float(v) for v in thresholds],
+        "p": [float(v) for v in curve],
         "brier": brier,
         "n": int(len(is_late)),
         "late_rate": float(is_late.mean()),

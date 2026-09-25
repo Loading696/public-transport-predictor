@@ -30,6 +30,7 @@ DROP_LONG_WINDOW = "speed_1800s"
 DROP_RATIO = 0.5
 DROP_LONG_MIN_KMH = 10.0
 STALE_AGE_S = 900.0
+STALE_GPS_VALID = 0.3
 BACKLOG_S = 120.0
 
 
@@ -97,10 +98,29 @@ def detect_backlog(feat: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def detect_stale(feat: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Stale or lost telemetry: last event far behind T or GPS mostly invalid."""
+    age = _num(feat, "last_event_age_s")
+    gps = _num(feat, "gps_valid_300s")
+    if age is not None and age > STALE_AGE_S:
+        return {
+            "type": "stale",
+            "confidence": round(_clip01(age / 3600.0), 3),
+            "reason": f"телеметрия устарела: последнее событие {age:.0f} с назад",
+        }
+    if gps is not None and gps < STALE_GPS_VALID:
+        return {
+            "type": "stale",
+            "confidence": round(_clip01(1.0 - gps / STALE_GPS_VALID), 3),
+            "reason": f"потеря GPS: доля валидных координат {gps:.2f} за 5 мин",
+        }
+    return None
+
+
 def detect_all(feat: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Run every detector; strongest first. Never raises on bad input."""
     events = []
-    for detector in (detect_dwell, detect_speed_drop, detect_backlog):
+    for detector in (detect_stale, detect_dwell, detect_speed_drop, detect_backlog):
         try:
             event = detector(feat)
         except Exception:  # noqa: BLE001 - detectors must be total functions
@@ -112,7 +132,7 @@ def detect_all(feat: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def cause_scores(feat: Mapping[str, Any]) -> dict[str, float]:
     """Per-cause confidence map for the incident card. Keys are stable API."""
-    scores = {"dwell": 0.0, "speed_drop": 0.0, "backlog": 0.0}
+    scores = {"dwell": 0.0, "speed_drop": 0.0, "backlog": 0.0, "stale": 0.0}
     for event in detect_all(feat):
         scores[event["type"]] = max(scores[event["type"]], float(event["confidence"]))
     return scores

@@ -38,13 +38,28 @@ BACKLOG = {
     "speed_300s_mean": 25.0, "speed_300s_moving_frac": 0.9,
     "speed_1800s_mean": 24.0, "cur_dev_s": 200.0,
 }
+STALE_AGE = {
+    "speed_300s_mean": 25.0, "speed_300s_moving_frac": 0.9,
+    "speed_1800s_mean": 24.0, "cur_dev_s": 10.0,
+    "last_event_age_s": 1200.0, "gps_valid_300s": 0.9,
+}
+STALE_GPS = {
+    "speed_300s_mean": 25.0, "speed_300s_moving_frac": 0.9,
+    "speed_1800s_mean": 24.0, "cur_dev_s": 10.0,
+    "last_event_age_s": 30.0, "gps_valid_300s": 0.1,
+}
+BOUNDARY = {
+    "speed_300s_mean": 3.0, "speed_300s_moving_frac": 0.2,
+    "speed_1800s_mean": 24.0, "cur_dev_s": 120.0,
+    "last_event_age_s": 30.0, "gps_valid_300s": 0.9,
+}
 GARBAGE = {"speed_300s_mean": float("nan"), "cur_dev_s": "oops"}
 
 
 def _check_contract(events: list[dict]) -> None:
     for event in events:
         assert set(event) == {"type", "confidence", "reason"}, event
-        assert event["type"] in {"dwell", "speed_drop", "backlog"}, event
+        assert event["type"] in {"dwell", "speed_drop", "backlog", "stale"}, event
         assert 0.0 <= event["confidence"] <= 1.0, event
         assert isinstance(event["reason"], str) and event["reason"], event
 
@@ -57,11 +72,16 @@ def main() -> None:
     assert any(e["type"] == "speed_drop" for e in drop), drop
     backlog = detect_all(BACKLOG)
     assert any(e["type"] == "backlog" for e in backlog), backlog
+    assert any(e["type"] == "stale" for e in detect_all(STALE_AGE)), STALE_AGE
+    assert any(e["type"] == "stale" for e in detect_all(STALE_GPS)), STALE_GPS
+    boundary = detect_all(BOUNDARY)
+    assert any(e["type"] == "dwell" for e in boundary), boundary
+    assert any(e["type"] == "backlog" for e in boundary), boundary
     assert detect_all({}) == [] and detect_all(GARBAGE) == []
-    for case in (FREE_FLOW, STANDSTILL, COLLAPSE, BACKLOG, {}, GARBAGE):
+    for case in (FREE_FLOW, STANDSTILL, COLLAPSE, BACKLOG, STALE_AGE, STALE_GPS, BOUNDARY, {}, GARBAGE):
         _check_contract(detect_all(case))
     scores = cause_scores(STANDSTILL)
-    assert set(scores) == {"dwell", "speed_drop", "backlog"}, scores
+    assert set(scores) == {"dwell", "speed_drop", "backlog", "stale"}, scores
     print("ALL PATTERN TESTS PASSED")
 
 
