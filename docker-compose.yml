@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    ports:
+      - "8000:8000"
+      - "9201:9201"
+    environment:
+      DATASET_DIR: /app/dataset
+      MODEL_PATH: /app/ml/model.cbm
+      FEATURES_PATH: /app/ml/features.json
+      SIMULATION_SPEED: "60"
+      TCP_PORT: "9201"
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./dashboard/Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Живой эмулятор NDTP: образ подгружается вручную
+  #   docker load -i dataset/ndtp-telemetry-emulator.tar
+  # конфиг шлется отдельно: POST http://localhost:18080/api/config (см. ndtp-emu-config.json).
+  # Профиль: docker compose --profile emu up
+  ndtp-emu:
+    image: "ndtp-telemetry-emulator:1.0"
+    profiles: ["emu"]
+    ports:
+      - "18080:18080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
