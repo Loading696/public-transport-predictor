@@ -1,0 +1,8 @@
+dataset/ndtp-telemetry-emulator.tar
+dataset/labels/
+dataset/train/
+dataset/test/
+dataset/docs/
+**/__pycache__/
+*.pyc
+.env
