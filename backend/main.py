@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -107,6 +108,60 @@ KNOWN_ROUTES = [
 
 def _get_ndtp() -> NDTPReceiver | None:
     return getattr(app.state, "ndtp", None)
+
+
+def _unit_tr_map() -> dict[int, int]:
+    raw = os.getenv("UNIT_TR_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    mapping: dict[int, int] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            try:
+                mapping[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return mapping
+
+
+async def _live_units() -> list[dict[str, Any]]:
+    """Latest position per connected NDTP unit (live emulator feed)."""
+    receiver = _get_ndtp()
+    if receiver is None:
+        return []
+    rows = await receiver.snapshot_rows()
+    latest: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            latest[int(row.get("unit_id", -1))] = row
+        except (TypeError, ValueError):
+            continue
+    mapping = _unit_tr_map()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    units: list[dict[str, Any]] = []
+    for unit_id in sorted(latest):
+        row = latest[unit_id]
+        event_time = row.get("event_time")
+        age = (now - event_time).total_seconds() if event_time is not None else None
+        units.append(
+            {
+                "unit_id": unit_id,
+                "tr_id": mapping.get(unit_id, unit_id),
+                "mapped": unit_id in mapping,
+                "lon": row.get("lon"),
+                "lat": row.get("lat"),
+                "speed": row.get("speed"),
+                "heading": row.get("heading"),
+                "location_valid": bool(row.get("location_valid", False)),
+                "event_time": event_time.isoformat() if hasattr(event_time, "isoformat") else event_time,
+                "age_s": age,
+            }
+        )
+    return units
 
 
 @app.exception_handler(404)
@@ -214,7 +269,9 @@ async def stream_status(
             simulator.set_speed(speed)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return simulator.status()
+    data = simulator.status()
+    data["live_units"] = await _live_units()
+    return data
 
 
 @app.get("/ndtp/status")

@@ -103,7 +103,7 @@ def map_center(routes: list, positions: list) -> list[float]:
     return [sum(point[0] for point in points) / len(points), sum(point[1] for point in points) / len(points)]
 
 
-def render_network(routes: list, positions: list, vehicles_by_id: dict) -> None:
+def render_network(routes: list, positions: list, vehicles_by_id: dict, live_units: list) -> None:
     geometry_routes = []
     for route in routes:
         polyline = []
@@ -114,7 +114,7 @@ def render_network(routes: list, positions: list, vehicles_by_id: dict) -> None:
                 polyline.append([lat, lon])
         if len(polyline) >= 2:
             geometry_routes.append({**route, "polyline": polyline})
-    if not geometry_routes and not positions:
+    if not geometry_routes and not positions and not live_units:
         st.info("Маршрутная геометрия появится после первых прогнозов.")
         return
     network = folium.Map(location=map_center(geometry_routes, positions), zoom_start=11, tiles="CartoDB positron")
@@ -152,12 +152,24 @@ def render_network(routes: list, positions: list, vehicles_by_id: dict) -> None:
             fill_opacity=0.9,
             tooltip=f"ТС {position.get('tr_id')} · {short_time(position.get('event_time'))}",
         ).add_to(network)
+    for unit in live_units:
+        lat = finite_number(unit.get("lat"))
+        lon = finite_number(unit.get("lon"))
+        if lat is None or lon is None:
+            continue
+        speed = finite_number(unit.get("speed"))
+        folium.Marker(
+            [lat, lon],
+            icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
+            tooltip=f"NDTP юнит {unit.get('unit_id')} · {speed:.0f} км/ч" if speed is not None else f"NDTP юнит {unit.get('unit_id')}",
+        ).add_to(network)
     st_folium(network, width=1100, height=520, key="route-network", returned_objects=[])
     st.markdown(
         '<div style="display:flex;gap:16px;margin:4px 0 0">'
         '<span><span style="color:#22c55e">●</span> в графике</span>'
         '<span><span style="color:#eab308">●</span> под риском</span>'
         '<span><span style="color:#ef4444">●</span> опоздание</span>'
+        '<span><span style="color:#1d4ed8">◆</span> живой NDTP-юнит</span>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -207,6 +219,7 @@ map_data = status_data.get("map", {}) if isinstance(status_data.get("map"), dict
 routes = map_data.get("routes", [])
 positions = map_data.get("positions", [])
 incident = map_data.get("incident")
+live_units = status_data.get("live_units", [])
 vehicles_by_id = {vehicle.get("tr_id"): vehicle for vehicle in vehicles}
 for position in positions:
     vehicle = vehicles_by_id.get(position.get("tr_id"), {})
@@ -221,7 +234,27 @@ columns[2].metric("Обработано точек", f"{status_data.get('process
 columns[3].metric("ТС в прогнозе", len(vehicles))
 
 st.subheader("Маршрутная сеть и позиции ТС")
-render_network(routes, positions, vehicles_by_id)
+render_network(routes, positions, vehicles_by_id, live_units)
+
+st.subheader("Живой поток NDTP")
+if not live_units:
+    st.info("Нет подключенных NDTP-юнитов: эмулятор не передает поток.")
+else:
+    live_table = pd.DataFrame(live_units)
+    st.dataframe(
+        live_table[["unit_id", "tr_id", "mapped", "speed", "age_s", "event_time"]].rename(
+            columns={
+                "unit_id": "Юнит",
+                "tr_id": "ТС",
+                "mapped": "Маппинг",
+                "speed": "Скорость, км/ч",
+                "age_s": "Возраст, с",
+                "event_time": "Время события",
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
 
 st.subheader("Карточка инцидента")
 render_incident(incident)
