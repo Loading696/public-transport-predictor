@@ -67,6 +67,29 @@ def recommendation_for(delay_s: float) -> str:
 
 RISK_COLORS = {"on-time": "#22c55e", "at-risk": "#eab308", "late": "#ef4444"}
 
+CAUSE_LABELS = {
+    "stale": "телеметрия недостоверна (простой потока или потеря GPS)",
+    "backlog": "накопленное отставание от графика сохраняется к целевой остановке",
+    "dwell": "простой или посадка на подходе к целевой остановке",
+    "speed_drop": "аномальное снижение скорости на подходе к участку",
+}
+CAUSE_FALLBACK = "отклонение операционного режима от планового графика"
+
+
+def cause_from_events(events: Any) -> tuple[str, str]:
+    """Pick the incident cause from pattern events: data quality first, then strong signal."""
+    if not isinstance(events, list) or not events:
+        return CAUSE_FALLBACK, "none"
+    ranked = sorted(
+        (e for e in events if isinstance(e, dict)),
+        key=lambda e: ({"data_quality": 0, "strong_signal": 1}.get(e.get("role"), 2), -float(e.get("confidence", 0.0))),
+    )
+    for event in ranked:
+        label = CAUSE_LABELS.get(str(event.get("type")))
+        if label is not None:
+            return label, str(event.get("role", "weak_signal"))
+    return CAUSE_FALLBACK, "none"
+
 
 def _finite_float(value: Any) -> float | None:
     try:
@@ -461,12 +484,16 @@ class StreamSimulator:
             "lat": _json_value(row.get("lat")),
         }
 
-    def _snapshot_for_point(self, point: dict[str, Any]) -> dict[str, Any]:
+    def _snapshot_for_point(
+        self, point: dict[str, Any], events: list | None = None
+    ) -> dict[str, Any]:
         vehicle_id = int(point["tr_id"])
         forecast_time = pd.Timestamp(point["T"])
         target_id = int(point["target_stop_id"])
         target_time = pd.Timestamp(point["target_time_begin"])
-        current_deviation = float(point["cur_dev_s"])
+        cur_dev_raw = point.get("cur_dev_s")
+        current_deviation = _finite_float(cur_dev_raw) or 0.0
+        cur_dev_hint = "none" if cur_dev_raw is None else "input"
         history = self._causal_history(vehicle_id, forecast_time)
         position = _latest_position(history)
         last_time = pd.Timestamp(history[-1]["event_time"]) if history else None
@@ -493,22 +520,15 @@ class StreamSimulator:
         previous = schedule[schedule["time_begin"] <= forecast_time].tail(1)
         following = schedule[schedule["time_begin"] > forecast_time].head(1)
         target_previous = schedule[schedule["time_begin"] < target_time].tail(1)
-        if not history:
-            cause = "телеметрия отсутствует: прогноз опирается на плановое расписание и последнее известное отклонение"
-        elif position is None:
-            cause = "нет достоверных координат: траекторию и причину по движению определить нельзя"
-        elif last_age is not None and last_age > 900:
-            cause = "телеметрия устарела: последнее событие значительно старше момента прогноза"
-        elif average_speed is not None and average_speed <= 5.0:
-            cause = "низкая скорость или простой перед целевым участком"
-        elif average_speed is not None and average_speed <= 12.0:
-            cause = "замедленное движение на подходе к целевой остановке"
-        elif current_deviation >= 120.0:
-            cause = "накопленное отставание от графика сохраняется к целевой остановке"
-        elif len(remaining) >= 3:
-            cause = "плотный плановый участок: несколько остановок между прогнозом и целью"
-        else:
-            cause = "отклонение операционного режима от планового графика"
+        # Cause comes from the measured pattern detectors; the hand-rolled
+        # speed/deviation heuristics stay only as a fallback for rows the
+        # detectors could not score (no history at all).
+        cause, cause_role = cause_from_events(events)
+        if cause_role == "none":
+            if not history:
+                cause = "телеметрия отсутствует: прогноз опирается на плановое расписание и последнее известное отклонение"
+            elif position is None:
+                cause = "нет достоверных координат: траекторию и причину по движению определить нельзя"
         return {
             "forecast_time": _json_value(forecast_time),
             "target": target,
@@ -530,6 +550,9 @@ class StreamSimulator:
                 "target": target,
             },
             "cause": cause,
+            "cause_role": cause_role,
+            "pattern_events": events or [],
+            "cur_dev_hint": cur_dev_hint,
         }
 
     def _select_incident(self) -> dict[str, Any] | None:
@@ -557,6 +580,9 @@ class StreamSimulator:
             "risk": record.get("risk"),
             "recommendation": record.get("recommendation"),
             "cause": snapshot.get("cause"),
+            "cause_role": snapshot.get("cause_role"),
+            "p_late": record.get("p_late"),
+            "cur_dev_hint": snapshot.get("cur_dev_hint"),
             "position_now": _latest_position(self._vehicle_telemetry.get(vehicle_id, [])),
             "snapshot": snapshot,
         }
@@ -577,7 +603,8 @@ class StreamSimulator:
             result = self.service.predict_frame([point], pd.DataFrame(self._visible_traffic))
             if not result.empty:
                 record = _record_for_response(result.iloc[0])
-                record["snapshot"] = self._snapshot_for_point(point)
+                events = record.get("pattern_events") or []
+                record["snapshot"] = self._snapshot_for_point(point, events)
                 self._vehicles[int(record["tr_id"])] = record
             self._point_position += 1
         if self._traffic_position >= len(self._traffic_rows) and self._point_position >= len(self._point_rows):

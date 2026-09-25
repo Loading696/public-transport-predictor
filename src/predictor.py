@@ -80,6 +80,31 @@ def _safe_stats(values: np.ndarray, prefix: str, result: dict[str, float]) -> No
         result[f"{prefix}_le_{int(limit)}"] = float(np.mean(values <= limit))
 
 
+DWELL_SPEED_KMH = 3.0
+
+
+def _dwell_stats(speeds: np.ndarray, times_ns: np.ndarray) -> tuple[float, float]:
+    """Longest near-zero-speed run (seconds) and its age before the last event.
+
+    Causal: only the supplied prefix is scanned. Returns (dwell_s, age_to_onset_s);
+    both NaN when no finite samples or no dwell detected.
+    """
+    if speeds.size == 0:
+        return math.nan, math.nan
+    stopped = np.isfinite(speeds) & (speeds <= DWELL_SPEED_KMH)
+    if not stopped.any():
+        return 0.0, math.nan
+    # Vectorized longest-true-run: boundaries where the run changes.
+    padded = np.concatenate(([False], stopped, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    starts, ends = edges[0::2], edges[1::2]
+    lengths = ends - starts
+    best = int(np.argmax(lengths))
+    onset = int(times_ns[starts[best]])
+    end = int(times_ns[ends[best] - 1])
+    return (end - onset) / 1e9, (int(times_ns[-1]) - onset) / 1e9
+
+
 def _telemetry_features_for_point(
     *,
     end: int,
@@ -99,10 +124,8 @@ def _telemetry_features_for_point(
 
     last_time_ns = int(times_ns[end - 1])
     out["telemetry_points"] = float(end)
-    out["last_event_age_s"] = float((int(times_ns[-1]) - last_time_ns) / 1e9) if False else math.nan
-    # The caller supplies the query timestamp separately through the array
-    # offset below; keeping the initial value finite makes missing-history cases
-    # explicit rather than accidentally using a future row.
+    # Age is computed by the caller (query timestamp is not the array end);
+    # do not derive it from the array tail here.
     out.pop("last_event_age_s", None)
 
     for window in WINDOW_SECONDS:
@@ -113,6 +136,10 @@ def _telemetry_features_for_point(
         la = lats[idx]
         valid = valid_locations[idx] & np.isfinite(lo) & np.isfinite(la)
         _safe_stats(sp, f"speed_{window}s", out)
+        dwell_s, dwell_age_s = _dwell_stats(sp, times_ns[idx])
+        out[f"dwell_{window}s"] = dwell_s
+        out[f"dwell_start_age_{window}s"] = dwell_age_s
+        out[f"dwell_frac_{window}s"] = dwell_s / float(window)
 
         if np.any(valid):
             valid_lon = lo[valid]

@@ -251,7 +251,18 @@ def render_incident(incident: dict | None) -> None:
     st.markdown(f"**Целевая остановка:** {html.escape(target_stop_text(incident))}")
     st.markdown(f"**Текущий участок:** {html.escape(segment_text(snapshot.get('current_segment')))}")
     st.markdown(f"**Участок до цели:** {html.escape(segment_text(snapshot.get('target_segment')))}")
-    st.markdown(f"**Предполагаемая причина (эвристика):** {html.escape(str(incident.get('cause', '—')))}")
+    role_labels = {
+        "strong_signal": "подтвержденный сигнал",
+        "weak_signal": "слабый сигнал",
+        "data_quality": "качество данных",
+        "none": "эвристика",
+    }
+    cause = str(incident.get("cause", "—"))
+    role = str(incident.get("cause_role") or snapshot.get("cause_role") or "none")
+    st.markdown(f"**Предполагаемая причина ({role_labels.get(role, role)}):** {html.escape(cause)}")
+    hint = str(incident.get("cur_dev_hint") or snapshot.get("cur_dev_hint") or "")
+    if hint == "none":
+        st.caption("Подсказка cur_dev_s по этому прогнозу отсутствует (оценка построена без неё).")
     position_text = "—"
     if position:
         speed = finite_number(position.get("speed"))
