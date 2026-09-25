@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import time
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -23,7 +24,7 @@ if reset:
     query["reset"] = "true"
 url = f"{BACKEND_URL}/stream/status?{urlencode(query)}"
 st.sidebar.caption(f"API: {BACKEND_URL}")
-st.markdown('<meta http-equiv="refresh" content="2">', unsafe_allow_html=True)
+auto = st.sidebar.checkbox("Автообновление каждые 2 с", value=True)
 
 
 def load_status() -> dict:
@@ -86,3 +87,7 @@ st.caption(
     f"Поток: {status_data.get('processed_traffic_rows', 0)} / {status_data.get('total_traffic_rows', 0)} "
     "строк телеметрии. Обновление выполняется каждые 2 секунды."
 )
+
+if auto:
+    time.sleep(2)
+    st.rerun()
