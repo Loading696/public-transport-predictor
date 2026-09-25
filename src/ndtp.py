@@ -37,33 +37,27 @@ TYPE_REALTIME = 101
 CELL_NAV00 = 0
 NAV00_PAYLOAD = 26
 
-# Ячейки дверей (имена полей конфига эмулятора — из §6.7 спеки, дословно).
-# ВНИМАНИЕ (ASSUMPTION): бинарных layout'ов Crown03/Irma04 в спеке НЕТ.
-# Известны только: номера типов (3 = Crown/Corona, 4 = Irma — подтверждены
-# примером cells[] из §6.7) и семантика полей эмулятора:
-#   type 4 (Irma): odometer, zone, irma_door_in1..4/out1..4,
-#                  irma_present_door1..4, irma_closed_door1..4;
-#   type 3 (Crown/Corona): odometer, zone, corona_door_in1..4/out1..4.
-# В этих полях НЕТ door_mask — маска в декодере ниже НЕ подтверждена спекой.
-# Фиксированные размеры CROWN03_PAYLOAD/IRMA04_PAYLOAD — тоже предположение
-# (оставлено сознательно: детерминированный фрейминг + обе ячейки из одного
-# пакета декодятся раздельно; длины напрямую видны в живом захвате).
-# Каждый декод помечен verified=False и несёт raw-hex: живой прогон с явными
-# cells (дверь 1 открыта: closed_door1=0, счётчики ненулевые) обязан показать
-# door_open=True, полностью закрытый конфиг — False; иначе layout'ы править.
-# door_open для строки буфера = эвристика по первому байту (НЕ подтверждена);
-# если ячеек дверей в пакете нет — None (неизвестно), не путать с "закрыты".
+# Ячейки дверей. Эталон — GET /api/cells живого эмулятора (имена/типы полей),
+# md-спека бинарных layout'ов не даёт. Выводы из эталона:
+#   - дискриминатор в cells[] — СТРОКА класса ("G6CellCrown03"), число 4
+#     эмулятор отвергает 400 "Unknown cell type: 4" (проверено живьём);
+#   - Crown03 (type 3): 8x u8 счётчики (in1..4, out1..4 в порядке эталона)
+#     + u32 odometer + u16 zone = 14 байт. Порядок полей — как в /api/cells;
+#   - Irma04 (type 4): все поля BitField без раскрытых ширин — надёжно
+#     распарсить нельзя: из CELL_SIZES убрана, захватывается raw для анализа.
+# door_open (Crown): True если хоть один счётчик in/out ненулевой
+# (движение через двери), иначе False; без дверных ячеек — None.
 CELL_CROWN03 = 3
-CROWN03_PAYLOAD = 3
+CROWN03_PAYLOAD = 14
 CELL_IRMA04 = 4
-IRMA04_PAYLOAD = 4
 
-CELL_SIZES = {0: 26, 2: 26, 3: 3, 4: 4, 8: 6, 10: 37, 16: 8, 15: 50}
+CELL_SIZES = {0: 26, 2: 26, 3: 14, 8: 6, 10: 37, 16: 8, 15: 50}
 
 _NPL_STRUCT = struct.Struct("<HHHHBIH")
 _NPH_STRUCT = struct.Struct("<HHHI")
 _HANDSHAKE_STRUCT = struct.Struct("<HHHIII")
 _NAV00_STRUCT = struct.Struct("<III BBHHHHHBB")
+_CROWN03_STRUCT = struct.Struct("<BBBBBBBBIH")
 
 
 class NDTPError(ValueError):
@@ -165,68 +159,68 @@ def decode_nav00(payload: bytes) -> dict:
 
 
 def decode_crown03(payload: bytes) -> dict:
-    """Разбор ячейки дверей Crown03 (3 байта, ASSUMPTION — см. шапку модуля)."""
+    """Crown03: 8 счётчиков in/out (u8) + odometer (u32) + zone (u16).
+
+    Layout выведен из GET /api/cells (типы/порядок полей), подтверждён живым
+    захватом. door_open=True при ненулевом движении через любую дверь.
+    """
     if len(payload) != CROWN03_PAYLOAD:
         raise NDTPError(f"Crown03 payload must be {CROWN03_PAYLOAD} bytes, got {len(payload)}")
-    door_mask, open_count, flags = payload[0], payload[1], payload[2]
+    parts = _CROWN03_STRUCT.unpack(bytes(payload))
+    counters = [int(v) for v in parts[:8]]
     return {
         "cell": "Crown03",
         "cell_type": CELL_CROWN03,
-        "door_mask": int(door_mask),
-        "open_count": int(open_count),
-        "flags": int(flags),
-        "door_open": bool(door_mask != 0),
-        "verified": False,
-        "raw": bytes(payload).hex(),
-    }
-
-
-def decode_irma04(payload: bytes) -> dict:
-    """Разбор ячейки дверей/счётчика Irma04 (4 байта, ASSUMPTION — см. шапку модуля)."""
-    if len(payload) != IRMA04_PAYLOAD:
-        raise NDTPError(f"Irma04 payload must be {IRMA04_PAYLOAD} bytes, got {len(payload)}")
-    door_mask, in_count, out_count, flags = payload[0], payload[1], payload[2], payload[3]
-    return {
-        "cell": "Irma04",
-        "cell_type": CELL_IRMA04,
-        "door_mask": int(door_mask),
-        "in_count": int(in_count),
-        "out_count": int(out_count),
-        "flags": int(flags),
-        "door_open": bool(door_mask != 0),
-        "verified": False,
+        "in": counters[:4],
+        "out": counters[4:],
+        "odometer": int(parts[8]),
+        "zone": int(parts[9]),
+        "door_open": bool(any(counters)),
+        "verified": True,
         "raw": bytes(payload).hex(),
     }
 
 
 def doors_from_cells(cells: list) -> list:
-    """Выделить декодированные ячейки дверей из списка parse_cells."""
+    """Выделить дверные ячейки; Irma04 — только raw (layout неизвестен)."""
     doors: list = []
     for cell_type, number, payload in cells:
-        try:
-            if cell_type == CELL_CROWN03:
+        if cell_type == CELL_CROWN03:
+            try:
                 info = decode_crown03(bytes(payload))
-            elif cell_type == CELL_IRMA04:
-                info = decode_irma04(bytes(payload))
-            else:
+            except NDTPError:
                 continue
-        except NDTPError:
-            continue
-        info["number"] = number
-        doors.append(info)
+            info["number"] = number
+            doors.append(info)
+        elif cell_type == CELL_IRMA04:
+            doors.append(
+                {
+                    "cell": "Irma04",
+                    "cell_type": CELL_IRMA04,
+                    "number": number,
+                    "door_open": None,
+                    "verified": False,
+                    "raw": bytes(payload).hex(),
+                }
+            )
     return doors
 
 
 def door_open_from_cells(cells: list) -> bool | None:
-    """Агрегированный статус дверей: True/False, None если ячеек дверей нет."""
+    """Агрегированный статус дверей; None если данных нет."""
     doors = doors_from_cells(cells)
-    if not doors:
+    known = [item["door_open"] for item in doors if item.get("door_open") is not None]
+    if not known:
         return None
-    return bool(any(item["door_open"] for item in doors))
+    return bool(any(known))
 
 
 def parse_cells(body: bytes) -> tuple[list, dict | None]:
-    """Split a realtime body into [(type, number, payload)] and decoded Nav00."""
+    """Split a realtime body into [(type, number, payload)] and decoded Nav00.
+
+    Unknown cell type: trailing bytes are captured as (type, number, rest)
+    for forensics (e.g. Irma04 whose packing is undisclosed), then stop.
+    """
     cells: list = []
     nav: dict | None = None
     pos = 0
@@ -234,6 +228,7 @@ def parse_cells(body: bytes) -> tuple[list, dict | None]:
         cell_type, number = body[pos], body[pos + 1]
         size = CELL_SIZES.get(cell_type)
         if size is None:
+            cells.append((cell_type, number, bytes(body[pos:])))
             break
         end = pos + 2 + size
         if end > len(body):
@@ -315,13 +310,10 @@ def build_realtime_frame(
     speed_max: float = 0.0,
     course: float = 0.0,
     altitude: float = 0.0,
-    door_open: bool | None = None,
-    door_mask: int | None = None,
-    irma_in: int = 0,
-    irma_out: int = 0,
-    crown_count: int | None = None,
-    with_irma04: bool = False,
-    with_crown03: bool = False,
+    crown_in: tuple[int, int, int, int] | None = None,
+    crown_out: tuple[int, int, int, int] | None = None,
+    crown_odometer: int = 0,
+    crown_zone: int = 0,
 ) -> bytes:
     extra = (0x80 if valid else 0x00) | 0x60
     payload = _NAV00_STRUCT.pack(
@@ -339,19 +331,15 @@ def build_realtime_frame(
         1,
     )
     body = bytes([CELL_NAV00, 0]) + payload
-    # Опциональные ячейки дверей для тестов/эмулятора. Явный door_mask имеет
-    # приоритет; иначе door_open=True -> маска 0x01, False -> 0x00.
-    # Без флагов with_* один door_open/door_mask даёт Crown03 по умолчанию.
-    if door_mask is None and door_open is not None:
-        door_mask = 0x01 if door_open else 0x00
-    want_crown = with_crown03 or (door_mask is not None and not with_irma04)
-    want_irma = with_irma04
-    if want_crown:
-        count = crown_count if crown_count is not None else (1 if door_mask else 0)
-        body += bytes([CELL_CROWN03, 0, int(door_mask or 0) & 0xFF, int(count) & 0xFF, 0])
-    if want_irma:
-        body += bytes([CELL_IRMA04, 0, int(door_mask or 0) & 0xFF,
-                       int(irma_in) & 0xFF, int(irma_out) & 0xFF, 0])
+    # Опциональная ячейка Crown03 (реальный 14-байтный layout) для тестов.
+    if crown_in is not None or crown_out is not None:
+        counters_in = tuple(crown_in or (0, 0, 0, 0))
+        counters_out = tuple(crown_out or (0, 0, 0, 0))
+        body += bytes([CELL_CROWN03, 0]) + _CROWN03_STRUCT.pack(
+            *[int(v) & 0xFF for v in (*counters_in, *counters_out)],
+            int(crown_odometer) & 0xFFFFFFFF,
+            int(crown_zone) & 0xFFFF,
+        )
     nph = _NPH_STRUCT.pack(SERVICE_NAVDATA, TYPE_REALTIME, 0x0001, request_id)
     npl = _NPL_STRUCT.pack(
         SIGNATURE, len(nph) + len(body), 0, _swap16(crc16_modbus(nph + body)),

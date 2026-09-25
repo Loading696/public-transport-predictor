@@ -20,7 +20,9 @@ sys.path.insert(0, str(ROOT))
 from src.ndtp import (  # noqa: E402
     build_handshake_frame,
     build_realtime_frame,
+    decode_crown03,
     decode_nav00,
+    door_open_from_cells,
     parse_cells,
     parse_handshake_body,
     parse_nph,
@@ -110,9 +112,36 @@ def test_loopback() -> None:
     print("[PASS] TCP loopback handshake+realtime -> buffer")
 
 
+def test_crown03_roundtrip() -> None:
+    raw = build_realtime_frame(
+        UNIT_ID, 4, timestamp=TS, lon=LON, lat=LAT,
+        crown_in=(5, 0, 0, 0), crown_out=(3, 0, 0, 0),
+        crown_odometer=123456, crown_zone=1,
+    )
+    npl = parse_npl(raw[:15])
+    verify_crc(npl, raw[15:])
+    cells, nav = parse_cells(raw[15 + NPH_SIZE :])
+    assert nav is not None
+    crown = decode_crown03(cells[1][2])
+    assert crown["in"] == [5, 0, 0, 0] and crown["out"] == [3, 0, 0, 0], crown
+    assert crown["odometer"] == 123456 and crown["zone"] == 1, crown
+    assert crown["door_open"] is True and crown["verified"] is True
+    assert door_open_from_cells(cells) is True
+    quiet = build_realtime_frame(
+        UNIT_ID, 5, timestamp=TS, lon=LON, lat=LAT,
+        crown_in=(0, 0, 0, 0), crown_out=(0, 0, 0, 0),
+    )
+    cells_quiet, _ = parse_cells(quiet[15 + NPH_SIZE :])
+    assert door_open_from_cells(cells_quiet) is False
+    bare, _ = parse_cells(build_realtime_frame(UNIT_ID, 6, timestamp=TS, lon=LON, lat=LAT)[15 + NPH_SIZE :])
+    assert door_open_from_cells(bare) is None
+    print("[PASS] crown03 round-trip (counters/odometer/zone, open/closed/unknown)")
+
+
 def main() -> None:
     test_handshake()
     test_realtime_decode()
+    test_crown03_roundtrip()
     test_crc_reject()
     test_loopback()
     print("ALL NDTP TESTS PASSED")
