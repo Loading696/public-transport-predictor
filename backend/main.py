@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -16,7 +17,35 @@ from src.ndtp_server import NDTPReceiver
 
 DEFAULT_SPEED = float(os.getenv("SIMULATION_SPEED", "60"))
 TCP_PORT = int(os.getenv("TCP_PORT", "9201"))
+# Троттлинг live-прогнозов: пересчёт для юнита не чаще TTL, повторные опросы
+# /stream/status без новых данных отдают кэшированный прогноз.
+LIVE_PREDICT_TTL = float(os.getenv("LIVE_PREDICT_TTL", "10"))
 app = FastAPI(title="Transport Delay MVP", version="1.0.0")
+
+# Кэш прогнозов живого потока: (unit_id, event_time_iso) -> (mono_ts, forecast).
+# forecast — только прогнозная часть юнита (позиция/двери всегда свежие из строк).
+_LIVE_FORECAST_CACHE: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _reset_live_forecast_cache() -> None:
+    """Сброс кэша live-прогнозов (для тестов)."""
+    _LIVE_FORECAST_CACHE.clear()
+
+
+# Прогнозная часть юнита, покрытая кэшем (позиция/двери/возраст всегда свежие).
+_FORECAST_KEYS = (
+    "target_stop_id",
+    "target_time_begin",
+    "target_status",
+    "target_note",
+    "cur_dev_hint",
+    "prediction",
+    "risk",
+    "target_class",
+    "recommendation",
+    "p_late",
+    "pattern_events",
+)
 
 
 class TelemetryEvent(BaseModel):
@@ -151,6 +180,10 @@ async def _live_units() -> list[dict[str, Any]]:
     плейсхолдер 0.0 — модель тяжело опирается на эту подсказку и тянет
     прогноз к «по графику». Это задекларировано меткой cur_dev_hint="none"
     рядом с прогнозом (бейдж «без подсказки» в дашборде), а не молча.
+
+    Троттлинг: прогноз кэшируется по (unit_id, event_time) на LIVE_PREDICT_TTL
+    секунд — повторные опросы без новых данных пересчёта не вызывают
+    (forecast_cached=True).
     """
     receiver = _get_ndtp()
     if receiver is None:
@@ -213,16 +246,30 @@ async def _live_units() -> list[dict[str, Any]]:
                     "risk": None,
                     "target_class": None,
                     "recommendation": None,
+                    "forecast_cached": False,
                 }
             )
         return units
     try:
         points: list[dict[str, Any]] = []
         point_unit_idx: list[int] = []
+        cached_idx: set[int] = set()
         telemetry: list[dict[str, Any]] = []
+        now_mono = time.monotonic()
         for idx, unit in enumerate(units):
+            event_time = unit.pop("_event_time", None)
+            event_key = unit.get("event_time") or ""
+            unit["forecast_cached"] = False
+            if event_key:
+                hit = _LIVE_FORECAST_CACHE.get((unit["unit_id"], event_key))
+                if hit is not None and now_mono - hit[0] <= LIVE_PREDICT_TTL:
+                    # Новых данных нет и кэш свежий — пересчёт не нужен.
+                    unit.update(hit[1])
+                    unit["forecast_cached"] = True
+                    cached_idx.add(idx)
+                    continue
             target_id, target_time, target_status = _live_target(
-                runtime, unit["tr_id"], unit.pop("_event_time", None)
+                runtime, unit["tr_id"], event_time
             )
             unit["target_stop_id"] = target_id
             unit["target_time_begin"] = target_time.isoformat() if hasattr(target_time, "isoformat") else target_time
@@ -276,8 +323,10 @@ async def _live_units() -> list[dict[str, Any]]:
             for pos, record in zip(point_unit_idx, result):
                 predicted[pos] = record
         for idx, unit in enumerate(units):
+            unit.pop("_target_time", None)
+            if idx in cached_idx:
+                continue
             record = predicted.get(idx)
-            target_time = unit.pop("_target_time", None)
             if record is None:
                 if unit.get("target_status") != "ok":
                     unit.update({"prediction": None, "risk": None, "target_class": None, "recommendation": None})
@@ -299,6 +348,22 @@ async def _live_units() -> list[dict[str, Any]]:
                         "recommendation": record.get("recommendation"),
                     }
                 )
+                # Passthrough полей Person A (p_late/pattern_events): сегодня
+                # runtime их не отдаёт — ключи просто отсутствуют; после мержа
+                # prob-wire подхватятся автоматически, без правок здесь.
+                if "p_late" in record:
+                    unit["p_late"] = record["p_late"]
+                if "pattern_events" in record:
+                    unit["pattern_events"] = record["pattern_events"]
+                event_key = unit.get("event_time") or ""
+                if event_key:
+                    # Evict stale entries of the same unit: cache holds only
+                    # the latest event_time, otherwise it grows forever.
+                    for key in [k for k in _LIVE_FORECAST_CACHE if k[0] == unit["unit_id"]]:
+                        del _LIVE_FORECAST_CACHE[key]
+                    _LIVE_FORECAST_CACHE[(unit["unit_id"], event_key)] = (
+                        now_mono, {key: unit.get(key) for key in _FORECAST_KEYS}
+                    )
     except Exception:
         for unit in units:
             unit.pop("_event_time", None)
@@ -310,6 +375,7 @@ async def _live_units() -> list[dict[str, Any]]:
             unit.setdefault("target_status", "no_model")
             unit.setdefault("target_note", "прогноз недоступен")
             unit.setdefault("cur_dev_hint", None)
+            unit.setdefault("forecast_cached", False)
     return units
 
 
