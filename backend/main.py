@@ -128,15 +128,29 @@ def _unit_tr_map() -> dict[int, int]:
     return mapping
 
 
+# Горизонт цели, на котором училась модель: плановая остановка строго
+# в окне (T+600, T+900] (см. lead_minus_660 = lead_s - 660 в фичах).
+# Цель ближе/дальше — out-of-distribution: lead_s улетает, прогноз мусорный,
+# поэтому вне окна прогноз не выдаём (prediction=None + пометка).
+LIVE_TARGET_MIN_S = 600
+LIVE_TARGET_MAX_S = 900
+
+
 async def _live_units() -> list[dict[str, Any]]:
     """Latest position per connected NDTP unit (live emulator feed).
 
     Каждый юнит обогащается:
       - tr_id через UNIT_TR_MAP (env JSON {"unitId": tr_id}),
       - door_open из ячеек Crown03/Irma04 (True/False/None),
-      - целью = ближайшая плановая остановка из расписания по tr_id
-        (первая time_begin > event_time, иначе последняя),
+      - целью = первая плановая остановка из расписания по tr_id
+        в окне (T+600, T+900]; вне окна — prediction=None + target_note,
       - прогнозом задержки через InferenceService.predict_records.
+
+    Честность live-прогноза: фактического отклонения cur_dev_s для живых
+    юнитов нет (нет time_fact), поэтому в точку подставляется нейтральный
+    плейсхолдер 0.0 — модель тяжело опирается на эту подсказку и тянет
+    прогноз к «по графику». Это задекларировано меткой cur_dev_hint="none"
+    рядом с прогнозом (бейдж «без подсказки» в дашборде), а не молча.
     """
     receiver = _get_ndtp()
     if receiver is None:
@@ -192,6 +206,9 @@ async def _live_units() -> list[dict[str, Any]]:
                 {
                     "target_stop_id": None,
                     "target_time_begin": None,
+                    "target_status": "no_model",
+                    "target_note": "прогноз недоступен: нет модели/расписания",
+                    "cur_dev_hint": None,
                     "prediction": None,
                     "risk": None,
                     "target_class": None,
@@ -201,13 +218,19 @@ async def _live_units() -> list[dict[str, Any]]:
         return units
     try:
         points: list[dict[str, Any]] = []
+        point_unit_idx: list[int] = []
         telemetry: list[dict[str, Any]] = []
-        for unit in units:
-            target_id, target_time = _live_target(runtime, unit["tr_id"], unit.pop("_event_time", None))
+        for idx, unit in enumerate(units):
+            target_id, target_time, target_status = _live_target(
+                runtime, unit["tr_id"], unit.pop("_event_time", None)
+            )
             unit["target_stop_id"] = target_id
             unit["target_time_begin"] = target_time.isoformat() if hasattr(target_time, "isoformat") else target_time
             unit["_target_time"] = target_time
-            if target_id is None or target_time is None:
+            unit["target_status"] = target_status
+            unit["target_note"] = _target_note(target_status)
+            unit["cur_dev_hint"] = None
+            if target_status != "ok":
                 unit.update({"prediction": None, "risk": None, "target_class": None, "recommendation": None})
                 continue
             points.append(
@@ -216,9 +239,16 @@ async def _live_units() -> list[dict[str, Any]]:
                     "T": unit["event_time"],
                     "target_stop_id": target_id,
                     "target_time_begin": unit["target_time_begin"],
+                    # ВНИМАНИЕ: фактического отклонения для live-юнитов нет.
+                    # 0.0 — нейтральный плейсхолдер, а не измерение: модель
+                    # опирается на cur_dev_s и смещает прогноз к «по графику».
+                    # Метка cur_dev_hint="none" + бейдж «без подсказки» в UI
+                    # делают это явным рядом с каждым live-прогнозом.
                     "cur_dev_s": 0.0,
                 }
             )
+            unit["cur_dev_hint"] = "none"
+            point_unit_idx.append(idx)
         for row in rows:
             try:
                 uid = int(row.get("unit_id", -1))
@@ -237,19 +267,19 @@ async def _live_units() -> list[dict[str, Any]]:
                     "heading": row.get("heading"),
                 }
             )
-        predictions: dict[int, dict[str, Any]] = {}
+        # Привязка прогнозов — строго по индексу точки, а не по tr_id:
+        # несколько юнитов могут маппиться на один tr_id, а юниты вне
+        # горизонта точек не строят и чужой прогноз получать не должны.
+        predicted: dict[int, dict[str, Any]] = {}
         if points:
             result = await asyncio.to_thread(runtime.predict_records, points, telemetry or None)
-            for record in result:
-                try:
-                    predictions[int(record.get("tr_id"))] = record
-                except (TypeError, ValueError):
-                    continue
-        for unit in units:
-            record = predictions.get(unit["tr_id"])
+            for pos, record in zip(point_unit_idx, result):
+                predicted[pos] = record
+        for idx, unit in enumerate(units):
+            record = predicted.get(idx)
             target_time = unit.pop("_target_time", None)
             if record is None:
-                if unit.get("target_stop_id") is None:
+                if unit.get("target_status") != "ok":
                     unit.update({"prediction": None, "risk": None, "target_class": None, "recommendation": None})
                 else:
                     unit.update(
@@ -277,14 +307,32 @@ async def _live_units() -> list[dict[str, Any]]:
             unit.setdefault("risk", None)
             unit.setdefault("target_stop_id", None)
             unit.setdefault("target_time_begin", None)
+            unit.setdefault("target_status", "no_model")
+            unit.setdefault("target_note", "прогноз недоступен")
+            unit.setdefault("cur_dev_hint", None)
     return units
 
 
-def _live_target(runtime: Any, tr_id: int, event_time: Any) -> tuple[Any, Any]:
-    """Ближайшая плановая остановка из расписания по tr_id.
+def _target_note(status: str) -> str | None:
+    """Человекочитаемая пометка статуса цели для витрины."""
+    return {
+        "ok": None,
+        "no_schedule": "нет расписания для ТС",
+        "no_time": "нет времени события",
+        "out_of_horizon": "цель вне горизонта 10–15 мин",
+        "no_model": "прогноз недоступен",
+    }.get(status, "прогноз недоступен")
 
-    Первая остановка с time_begin > event_time; если таких нет — последняя;
-    если tr_id нет в расписании или время не распарсилось — (None, None).
+
+def _live_target(runtime: Any, tr_id: int, event_time: Any) -> tuple[Any, Any, str]:
+    """Первая плановая остановка по tr_id в окне (T+600, T+900].
+
+    Возвращает (target_stop_id, target_time_begin, status), где status:
+      "ok" — цель в горизонте, можно прогнозировать;
+      "no_schedule" — tr_id нет в расписании;
+      "no_time" — время события отсутствует/не парсится, окно не проверить;
+      "out_of_horizon" — в окне остановок нет (ближайшая через <600с или
+        только дальние >900с): цель OOD, прогноз не выдаём.
     """
     try:
         import pandas as pd
@@ -292,29 +340,32 @@ def _live_target(runtime: Any, tr_id: int, event_time: Any) -> tuple[Any, Any]:
         schedule = runtime.schedule
         frame = schedule[pd.to_numeric(schedule["tr_id"], errors="coerce") == tr_id].copy()
         if frame.empty:
-            return None, None
+            return None, None, "no_schedule"
         frame["time_begin"] = pd.to_datetime(frame["time_begin"], errors="coerce")
         frame = frame.dropna(subset=["time_begin"]).sort_values("time_begin", kind="stable")
         if frame.empty:
-            return None, None
+            return None, None, "no_schedule"
         ref = pd.to_datetime(event_time, errors="coerce") if event_time is not None else None
         if ref is None or pd.isna(ref):
-            # Без времени события берём первую плановую остановку как цель.
-            row = frame.iloc[0]
-        else:
-            future = frame[frame["time_begin"] > ref]
-            row = future.iloc[0] if not future.empty else frame.iloc[-1]
+            return None, None, "no_time"
+        window = frame[
+            (frame["time_begin"] > ref + pd.Timedelta(seconds=LIVE_TARGET_MIN_S))
+            & (frame["time_begin"] <= ref + pd.Timedelta(seconds=LIVE_TARGET_MAX_S))
+        ]
+        if window.empty:
+            return None, None, "out_of_horizon"
+        row = window.iloc[0]
         target_id = row.get("tt_action_item_id")
         try:
             target_id = int(target_id)
         except (TypeError, ValueError):
-            return None, None
+            return None, None, "no_schedule"
         target_time = row.get("time_begin")
         if pd.isna(target_time):
-            return None, None
-        return target_id, target_time
+            return None, None, "no_schedule"
+        return target_id, target_time, "ok"
     except Exception:
-        return None, None
+        return None, None, "no_model"
 
 
 @app.exception_handler(404)

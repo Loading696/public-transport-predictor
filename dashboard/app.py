@@ -387,6 +387,10 @@ with tab_live:
     else:
         live_rows = []
         for unit in live_units:
+            forecast: str = format_delay(unit.get("prediction"))
+            if unit.get("prediction") is None and unit.get("target_note"):
+                # Честная пометка вместо молчаливого прочерка (OOD-цель и т.п.).
+                forecast = str(unit.get("target_note"))
             live_rows.append(
                 {
                     "Юнит": unit.get("unit_id"),
@@ -394,7 +398,8 @@ with tab_live:
                     "Маппинг": unit.get("mapped"),
                     "Двери": door_badge(unit.get("door_open")),
                     "Скорость, км/ч": unit.get("speed"),
-                    "Прогноз": format_delay(unit.get("prediction")),
+                    "Прогноз": forecast,
+                    "Подсказка": "без подсказки" if unit.get("cur_dev_hint") == "none" else "—",
                     "Риск": unit.get("risk", "—"),
                     "Цель (остановка)": unit.get("target_stop_id", "—"),
                     "Плановое прибытие": short_time(unit.get("target_time_begin")),
@@ -406,14 +411,16 @@ with tab_live:
         for unit in live_units:
             badge = door_badge(unit.get("door_open"))
             color = "#fdba74" if unit.get("door_open") is True else ("#bbf7d0" if unit.get("door_open") is False else "#f3f4f6")
+            hint = " · без подсказки cur_dev" if unit.get("cur_dev_hint") == "none" else ""
+            note = f"<br>{html.escape(str(unit.get('target_note')))}" if unit.get("target_note") else ""
             st.markdown(
                 f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
                 f'<b>Юнит {html.escape(str(unit.get("unit_id")))} → ТС {html.escape(str(unit.get("tr_id")))}</b> · '
-                f'{html.escape(badge)} · прогноз {html.escape(format_delay(unit.get("prediction")))} · '
+                f'{html.escape(badge)} · прогноз {html.escape(format_delay(unit.get("prediction")))}{html.escape(hint)} · '
                 f'риск {html.escape(str(unit.get("risk", "—")))} · '
                 f'цель {html.escape(str(unit.get("target_stop_id", "—")))} '
                 f'({html.escape(short_time(unit.get("target_time_begin")))})<br>'
-                f'{html.escape(str(unit.get("recommendation", "—")))}</div>',
+                f'{html.escape(str(unit.get("recommendation", "—")))}{note}</div>',
                 unsafe_allow_html=True,
             )
     st.subheader("Карта живых юнитов")
