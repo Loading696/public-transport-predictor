@@ -27,7 +27,8 @@ if reset:
     query["reset"] = "true"
 url = f"{BACKEND_URL}/stream/status?{urlencode(query)}"
 st.sidebar.caption(f"API: {BACKEND_URL}")
-auto = st.sidebar.checkbox("Автообновление каждые 2 с", value=True)
+auto = st.sidebar.checkbox("Автообновление", value=False)
+refresh_s = st.sidebar.slider("Интервал обновления, с", min_value=2, max_value=30, value=5, step=1)
 
 
 def load_status() -> dict:
@@ -297,9 +298,10 @@ else:
 
 st.caption(
     f"Поток: {status_data.get('processed_traffic_rows', 0)} / {status_data.get('total_traffic_rows', 0)} "
-    "строк телеметрии. Обновление выполняется каждые 2 секунды."
+    "строк телеметрии."
+    + (" Автообновление включено." if auto else " Автообновление выключено — включите в сайдбаре или обновите страницу вручную.")
 )
 
 if auto:
-    time.sleep(2)
+    time.sleep(refresh_s)
     st.rerun()
