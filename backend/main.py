@@ -5,8 +5,11 @@ import os
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+
+from pathlib import Path
 
 from src.runtime import InferenceService, StreamSimulator
 
@@ -86,6 +89,61 @@ def _parse_request(payload: Any) -> PredictRequest:
         return PredictRequest.parse_obj(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+KNOWN_ROUTES = [
+    "/",
+    "/docs",
+    "/health",
+    "/predict",
+    "/generate_submission",
+    "/stream/status",
+    "/models",
+    "/v1/models",
+]
+
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": "not found",
+            "path": request.url.path,
+            "available": KNOWN_ROUTES,
+        },
+    )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
+@app.get("/models")
+def models() -> dict[str, Any]:
+    runtime = _get_runtime()
+    return {
+        "model": str(runtime.model_path),
+        "features": len(runtime.features),
+        "validate_points": len(runtime.points),
+    }
+
+
+@app.get("/v1/models")
+def v1_models() -> dict[str, Any]:
+    info = models()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": Path(info["model"]).stem,
+                "object": "model",
+                "owned_by": "hackathon",
+                "features": info["features"],
+            }
+        ],
+    }
 
 
 @app.get("/")
