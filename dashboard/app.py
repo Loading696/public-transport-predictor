@@ -58,6 +58,21 @@ def format_delay(seconds: object | None) -> str:
     return f"{delay:+.0f} с ({delay / 60.0:+.1f} мин)"
 
 
+def door_badge(value: object | None) -> str:
+    """Бейдж статуса дверей из live-потока (Crown03/Irma04)."""
+    if value is True:
+        return "🚪 Открыты"
+    if value is False:
+        return "🚪 Закрыты"
+    return "—"
+
+
+def door_marker_color(value: object | None) -> str:
+    if value is True:
+        return "orange"
+    return "blue"
+
+
 def stop_text(stop: dict | None) -> str:
     if not stop:
         return "—"
@@ -159,10 +174,16 @@ def render_network(routes: list, positions: list, vehicles_by_id: dict, live_uni
         if lat is None or lon is None:
             continue
         speed = finite_number(unit.get("speed"))
+        speed_text = f"{speed:.0f} км/ч" if speed is not None else "—"
+        door_text = door_badge(unit.get("door_open"))
+        prediction_text = format_delay(unit.get("prediction"))
         folium.Marker(
             [lat, lon],
-            icon=folium.Icon(color="blue", icon="bus", prefix="fa"),
-            tooltip=f"NDTP юнит {unit.get('unit_id')} · {speed:.0f} км/ч" if speed is not None else f"NDTP юнит {unit.get('unit_id')}",
+            icon=folium.Icon(color=door_marker_color(unit.get("door_open")), icon="bus", prefix="fa"),
+            tooltip=(
+                f"NDTP юнит {unit.get('unit_id')} (ТС {unit.get('tr_id')}) · {speed_text} · "
+                f"{door_text} · прогноз {prediction_text}"
+            ),
         ).add_to(network)
     st_folium(network, width=1100, height=520, key="route-network", returned_objects=[])
     st.markdown(
@@ -234,134 +255,176 @@ columns[1].metric("Скорость", f"x{status_data.get('speed', speed)}")
 columns[2].metric("Обработано точек", f"{status_data.get('processed_points', 0)} / {status_data.get('total_points', 0)}")
 columns[3].metric("ТС в прогнозе", len(vehicles))
 
-st.subheader("Табло расписания")
-sim_time = str(status_data.get("simulated_time") or "")
-veh_ids = sorted(vehicles_by_id.keys())
-if not veh_ids:
-    st.info("Нет активных ТС: прогнозы появятся после достижения симулятором времени T.")
-else:
-    selected = st.selectbox("ТС", veh_ids, key="schedule_vehicle")
-    vehicle = vehicles_by_id.get(selected, {})
-    target_id = str(vehicle.get("target_stop_id", ""))
-    prediction = finite_number(vehicle.get("prediction"))
-    route = next((item for item in routes if item.get("tr_id") == selected), None)
-    stops = route.get("stops", []) if route else []
-    timeline = []
-    next_marked = False
-    for stop in stops:
-        stop_time = str(stop.get("time") or "")
-        if stop_time and sim_time and stop_time <= sim_time:
-            status = "время прошло"
-        elif not next_marked:
-            status = "следующая"
-            next_marked = True
-        else:
-            status = "по плану"
-        is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
-        timeline.append(
-            {
-                "Время": short_time(stop.get("time")),
-                "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
-                "Статус": ("ЦЕЛЬ ПРОГНОЗА · " if is_target else "") + status,
-                "Прогноз": format_delay(prediction) if is_target else "—",
-            }
-        )
-    if timeline:
-        st.dataframe(pd.DataFrame(timeline), hide_index=True, use_container_width=True)
-    else:
-        st.info("Расписание этого ТС недоступно.")
+# Фильтр источника: replay (validate-симулятор) vs live (NDTP-эмулятор).
+source = st.radio("Источник данных", ["Все", "Replay", "Live"], horizontal=True, key="data_source")
+show_replay = source in ("Все", "Replay")
+show_live = source in ("Все", "Live")
+map_routes = routes if show_replay else []
+map_positions = positions if show_replay else []
+map_live = live_units if show_live else []
 
-    st.subheader("Ближайшие прибытия")
-    upcoming = []
-    for route in routes:
-        vehicle = vehicles_by_id.get(route.get("tr_id"), {})
+if not show_replay:
+    st.info("Replay-табло скрыто фильтром источника (выбран Live) — см. вкладку 📡 Live NDTP.")
+else:
+    st.subheader("Табло расписания")
+    sim_time = str(status_data.get("simulated_time") or "")
+    veh_ids = sorted(vehicles_by_id.keys())
+    if not veh_ids:
+        st.info("Нет активных ТС: прогнозы появятся после достижения симулятором времени T.")
+    else:
+        selected = st.selectbox("ТС", veh_ids, key="schedule_vehicle")
+        vehicle = vehicles_by_id.get(selected, {})
         target_id = str(vehicle.get("target_stop_id", ""))
         prediction = finite_number(vehicle.get("prediction"))
-        for stop in route.get("stops", []):
+        route = next((item for item in routes if item.get("tr_id") == selected), None)
+        stops = route.get("stops", []) if route else []
+        timeline = []
+        next_marked = False
+        for stop in stops:
             stop_time = str(stop.get("time") or "")
-            if sim_time and stop_time and stop_time > sim_time:
-                is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
-                upcoming.append(
-                    {
-                        "sort": stop_time,
-                        "Время": short_time(stop.get("time")),
-                        "ТС": route.get("tr_id"),
-                        "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
-                        "Прогноз": format_delay(prediction) if is_target else "—",
-                    }
-                )
-                break
-    upcoming = sorted(upcoming, key=lambda row: row["sort"])[:15]
-    if upcoming:
+            if stop_time and sim_time and stop_time <= sim_time:
+                status = "время прошло"
+            elif not next_marked:
+                status = "следующая"
+                next_marked = True
+            else:
+                status = "по плану"
+            is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
+            timeline.append(
+                {
+                    "Время": short_time(stop.get("time")),
+                    "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
+                    "Статус": ("ЦЕЛЬ ПРОГНОЗА · " if is_target else "") + status,
+                    "Прогноз": format_delay(prediction) if is_target else "—",
+                }
+            )
+        if timeline:
+            st.dataframe(pd.DataFrame(timeline), hide_index=True, use_container_width=True)
+        else:
+            st.info("Расписание этого ТС недоступно.")
+
+        st.subheader("Ближайшие прибытия")
+        upcoming = []
+        for route in routes:
+            vehicle = vehicles_by_id.get(route.get("tr_id"), {})
+            target_id = str(vehicle.get("target_stop_id", ""))
+            prediction = finite_number(vehicle.get("prediction"))
+            for stop in route.get("stops", []):
+                stop_time = str(stop.get("time") or "")
+                if sim_time and stop_time and stop_time > sim_time:
+                    is_target = bool(target_id) and str(stop.get("stop_id")) == target_id
+                    upcoming.append(
+                        {
+                            "sort": stop_time,
+                            "Время": short_time(stop.get("time")),
+                            "ТС": route.get("tr_id"),
+                            "Остановка": stop.get("address") or f"остановка {stop.get('stop_id', '—')}",
+                            "Прогноз": format_delay(prediction) if is_target else "—",
+                        }
+                    )
+                    break
+        upcoming = sorted(upcoming, key=lambda row: row["sort"])[:15]
+        if upcoming:
+            st.dataframe(
+                pd.DataFrame(upcoming).drop(columns=["sort"]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("Предстоящих прибытий в расписании нет.")
+
+tab_replay, tab_live = st.tabs(["🔁 Replay-поток", "📡 Live NDTP"])
+
+with tab_replay:
+    st.subheader("Маршрутная сеть и позиции ТС (replay)")
+    render_network(map_routes, map_positions, vehicles_by_id, [])
+
+    st.subheader("Карточка инцидента")
+    render_incident(incident)
+
+    st.subheader("Текущий риск")
+    if not vehicles:
+        st.info("Прогнозы появятся после достижения симулятором времени T.")
+    else:
+        table = pd.DataFrame(vehicles)
+        table["prediction_s"] = table["prediction"].round(1)
         st.dataframe(
-            pd.DataFrame(upcoming).drop(columns=["sort"]),
+            table[["tr_id", "prediction_s", "target_class", "risk", "target_time_begin", "recommendation"]].rename(
+                columns={
+                    "tr_id": "ТС",
+                    "prediction_s": "Задержка, с",
+                    "target_class": "Класс",
+                    "risk": "Риск",
+                    "target_time_begin": "Плановое прибытие",
+                    "recommendation": "Рекомендация",
+                }
+            ),
             hide_index=True,
             use_container_width=True,
         )
+        colors = {"on-time": "#dcfce7", "at-risk": "#fef3c7", "late": "#fee2e2"}
+        labels = {"on-time": "в графике", "at-risk": "под риском", "late": "опоздание"}
+        for vehicle in vehicles:
+            risk = vehicle.get("risk", "on-time")
+            color = colors.get(risk, "#f3f4f6")
+            label = labels.get(risk, risk)
+            delay = float(vehicle.get("prediction", 0.0))
+            target = html.escape(str(vehicle.get("target_time_begin", "—")))
+            recommendation = html.escape(str(vehicle.get("recommendation", "—")))
+            st.markdown(
+                f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
+                f'<b>ТС {html.escape(str(vehicle.get("tr_id")))}</b> · {delay:.1f} с · {label} · '
+                f'цель {target}<br>{recommendation}</div>',
+                unsafe_allow_html=True,
+            )
+
+with tab_live:
+    st.subheader("Живой поток NDTP")
+    if not show_live:
+        st.info("Live-поток скрыт фильтром источника (выбран Replay).")
+    elif not live_units:
+        st.info("Нет подключенных NDTP-юнитов: эмулятор не передает поток.")
     else:
-        st.info("Предстоящих прибытий в расписании нет.")
-
-st.subheader("Маршрутная сеть и позиции ТС")
-render_network(routes, positions, vehicles_by_id, live_units)
-
-st.subheader("Живой поток NDTP")
-if not live_units:
-    st.info("Нет подключенных NDTP-юнитов: эмулятор не передает поток.")
-else:
-    live_table = pd.DataFrame(live_units)
-    st.dataframe(
-        live_table[["unit_id", "tr_id", "mapped", "speed", "age_s", "event_time"]].rename(
-            columns={
-                "unit_id": "Юнит",
-                "tr_id": "ТС",
-                "mapped": "Маппинг",
-                "speed": "Скорость, км/ч",
-                "age_s": "Возраст, с",
-                "event_time": "Время события",
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-st.subheader("Карточка инцидента")
-render_incident(incident)
-
-st.subheader("Текущий риск")
-if not vehicles:
-    st.info("Прогнозы появятся после достижения симулятором времени T.")
-else:
-    table = pd.DataFrame(vehicles)
-    table["prediction_s"] = table["prediction"].round(1)
-    st.dataframe(
-        table[["tr_id", "prediction_s", "target_class", "risk", "target_time_begin", "recommendation"]].rename(
-            columns={
-                "tr_id": "ТС",
-                "prediction_s": "Задержка, с",
-                "target_class": "Класс",
-                "risk": "Риск",
-                "target_time_begin": "Плановое прибытие",
-                "recommendation": "Рекомендация",
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-    colors = {"on-time": "#dcfce7", "at-risk": "#fef3c7", "late": "#fee2e2"}
-    labels = {"on-time": "в графике", "at-risk": "под риском", "late": "опоздание"}
-    for vehicle in vehicles:
-        risk = vehicle.get("risk", "on-time")
-        color = colors.get(risk, "#f3f4f6")
-        label = labels.get(risk, risk)
-        delay = float(vehicle.get("prediction", 0.0))
-        target = html.escape(str(vehicle.get("target_time_begin", "—")))
-        recommendation = html.escape(str(vehicle.get("recommendation", "—")))
-        st.markdown(
-            f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
-            f'<b>ТС {html.escape(str(vehicle.get("tr_id")))}</b> · {delay:.1f} с · {label} · '
-            f'цель {target}<br>{recommendation}</div>',
-            unsafe_allow_html=True,
-        )
+        live_rows = []
+        for unit in live_units:
+            forecast: str = format_delay(unit.get("prediction"))
+            if unit.get("prediction") is None and unit.get("target_note"):
+                # Честная пометка вместо молчаливого прочерка (OOD-цель и т.п.).
+                forecast = str(unit.get("target_note"))
+            live_rows.append(
+                {
+                    "Юнит": unit.get("unit_id"),
+                    "ТС": unit.get("tr_id"),
+                    "Маппинг": unit.get("mapped"),
+                    "Двери": door_badge(unit.get("door_open")),
+                    "Скорость, км/ч": unit.get("speed"),
+                    "Прогноз": forecast,
+                    "Подсказка": "без подсказки" if unit.get("cur_dev_hint") == "none" else "—",
+                    "Риск": unit.get("risk", "—"),
+                    "Цель (остановка)": unit.get("target_stop_id", "—"),
+                    "Плановое прибытие": short_time(unit.get("target_time_begin")),
+                    "Возраст, с": round(float(unit["age_s"]), 1) if finite_number(unit.get("age_s")) is not None else "—",
+                    "Время события": short_time(unit.get("event_time")),
+                }
+            )
+        st.dataframe(pd.DataFrame(live_rows), hide_index=True, use_container_width=True)
+        for unit in live_units:
+            badge = door_badge(unit.get("door_open"))
+            color = "#fdba74" if unit.get("door_open") is True else ("#bbf7d0" if unit.get("door_open") is False else "#f3f4f6")
+            hint = " · без подсказки cur_dev" if unit.get("cur_dev_hint") == "none" else ""
+            note = f"<br>{html.escape(str(unit.get('target_note')))}" if unit.get("target_note") else ""
+            st.markdown(
+                f'<div style="background:{color};padding:10px 14px;border-radius:8px;margin:6px 0">'
+                f'<b>Юнит {html.escape(str(unit.get("unit_id")))} → ТС {html.escape(str(unit.get("tr_id")))}</b> · '
+                f'{html.escape(badge)} · прогноз {html.escape(format_delay(unit.get("prediction")))}{html.escape(hint)} · '
+                f'риск {html.escape(str(unit.get("risk", "—")))} · '
+                f'цель {html.escape(str(unit.get("target_stop_id", "—")))} '
+                f'({html.escape(short_time(unit.get("target_time_begin")))})<br>'
+                f'{html.escape(str(unit.get("recommendation", "—")))}{note}</div>',
+                unsafe_allow_html=True,
+            )
+    st.subheader("Карта живых юнитов")
+    render_network([], [], {}, map_live)
 
 st.caption(
     f"Поток: {status_data.get('processed_traffic_rows', 0)} / {status_data.get('total_traffic_rows', 0)} "

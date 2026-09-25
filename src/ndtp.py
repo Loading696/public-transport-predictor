@@ -34,7 +34,20 @@ TYPE_REALTIME = 101
 CELL_NAV00 = 0
 NAV00_PAYLOAD = 26
 
-CELL_SIZES = {0: 26, 2: 26, 8: 6, 10: 37, 16: 8, 15: 50}
+# Ячейки дверей (см. dataset/docs/Emulator-and-Telematic-Packets-Specification.md).
+# Суффикс в имени = номер типа ячейки в realtime-потоке, размер payload фиксирован:
+#   Crown03 (type 3, 3 байта): [door_mask u8][open_count u8][flags u8]
+#     door_mask: битовая маска дверей (бит=1 — дверь открыта), 0 = все закрыты.
+#   Irma04 (type 4, 4 байта): [door_mask u8][in_count u8][out_count u8][flags u8]
+#     door_mask: та же битовая маска; in/out — счётчики пассажиров IRMA.
+# door_open для строки буфера = (door_mask != 0) по любой из ячеек; если ячеек
+# дверей нет в пакете — None (неизвестно), чтобы не путать с "закрыты".
+CELL_CROWN03 = 3
+CROWN03_PAYLOAD = 3
+CELL_IRMA04 = 4
+IRMA04_PAYLOAD = 4
+
+CELL_SIZES = {0: 26, 2: 26, 3: 3, 4: 4, 8: 6, 10: 37, 16: 8, 15: 50}
 
 _NPL_STRUCT = struct.Struct("<HHHHBIH")
 _NPH_STRUCT = struct.Struct("<HHHI")
@@ -84,6 +97,8 @@ class RealtimePacket:
     nph: NPHHeader
     nav: dict | None = None
     cells: list = field(default_factory=list)
+    doors: list = field(default_factory=list)
+    door_open: bool | None = None
 
 
 def parse_npl(raw: bytes) -> NPLHeader:
@@ -138,6 +153,63 @@ def decode_nav00(payload: bytes) -> dict:
     }
 
 
+def decode_crown03(payload: bytes) -> dict:
+    """Разбор ячейки дверей Crown03 (3 байта)."""
+    if len(payload) != CROWN03_PAYLOAD:
+        raise NDTPError(f"Crown03 payload must be {CROWN03_PAYLOAD} bytes, got {len(payload)}")
+    door_mask, open_count, flags = payload[0], payload[1], payload[2]
+    return {
+        "cell": "Crown03",
+        "cell_type": CELL_CROWN03,
+        "door_mask": int(door_mask),
+        "open_count": int(open_count),
+        "flags": int(flags),
+        "door_open": bool(door_mask != 0),
+    }
+
+
+def decode_irma04(payload: bytes) -> dict:
+    """Разбор ячейки дверей/счётчика Irma04 (4 байта)."""
+    if len(payload) != IRMA04_PAYLOAD:
+        raise NDTPError(f"Irma04 payload must be {IRMA04_PAYLOAD} bytes, got {len(payload)}")
+    door_mask, in_count, out_count, flags = payload[0], payload[1], payload[2], payload[3]
+    return {
+        "cell": "Irma04",
+        "cell_type": CELL_IRMA04,
+        "door_mask": int(door_mask),
+        "in_count": int(in_count),
+        "out_count": int(out_count),
+        "flags": int(flags),
+        "door_open": bool(door_mask != 0),
+    }
+
+
+def doors_from_cells(cells: list) -> list:
+    """Выделить декодированные ячейки дверей из списка parse_cells."""
+    doors: list = []
+    for cell_type, number, payload in cells:
+        try:
+            if cell_type == CELL_CROWN03:
+                info = decode_crown03(bytes(payload))
+            elif cell_type == CELL_IRMA04:
+                info = decode_irma04(bytes(payload))
+            else:
+                continue
+        except NDTPError:
+            continue
+        info["number"] = number
+        doors.append(info)
+    return doors
+
+
+def door_open_from_cells(cells: list) -> bool | None:
+    """Агрегированный статус дверей: True/False, None если ячеек дверей нет."""
+    doors = doors_from_cells(cells)
+    if not doors:
+        return None
+    return bool(any(item["door_open"] for item in doors))
+
+
 def parse_cells(body: bytes) -> tuple[list, dict | None]:
     """Split a realtime body into [(type, number, payload)] and decoded Nav00."""
     cells: list = []
@@ -163,7 +235,9 @@ def parse_realtime(npl: NPLHeader, nph: NPHHeader, body: bytes) -> RealtimePacke
     if (nph.service_id, nph.pkt_type) != (SERVICE_NAVDATA, TYPE_REALTIME):
         raise NDTPError(f"not a realtime packet: service={nph.service_id} type={nph.pkt_type}")
     cells, nav = parse_cells(body)
-    return RealtimePacket(npl=npl, nph=nph, nav=nav, cells=cells)
+    doors = doors_from_cells(cells)
+    door_open = door_open_from_cells(cells)
+    return RealtimePacket(npl=npl, nph=nph, nav=nav, cells=cells, doors=doors, door_open=door_open)
 
 
 def parse_handshake_body(body: bytes) -> dict:
@@ -178,10 +252,18 @@ def parse_handshake_body(body: bytes) -> dict:
     }
 
 
-def nav_to_telemetry(peer_address: int, nav: dict, tr_map: dict | None = None) -> dict:
+def nav_to_telemetry(
+    peer_address: int,
+    nav: dict,
+    tr_map: dict | None = None,
+    door_open: bool | None = None,
+    cells: list | None = None,
+) -> dict:
     """Convert a decoded Nav00 into a TelemetryEvent-style row (naive UTC)."""
     tr_id = (tr_map or {}).get(peer_address, peer_address)
     event_time = datetime.fromtimestamp(nav["timestamp"], tz=timezone.utc).replace(tzinfo=None)
+    if door_open is None and cells is not None:
+        door_open = door_open_from_cells(cells)
     return {
         "tr_id": int(tr_id),
         "unit_id": int(peer_address),
@@ -192,6 +274,7 @@ def nav_to_telemetry(peer_address: int, nav: dict, tr_map: dict | None = None) -
         "alt": float(nav["alt"]),
         "speed": float(nav["speed_avg"]),
         "heading": float(nav["course"]),
+        "door_open": door_open,
     }
 
 
@@ -217,6 +300,13 @@ def build_realtime_frame(
     speed_max: float = 0.0,
     course: float = 0.0,
     altitude: float = 0.0,
+    door_open: bool | None = None,
+    door_mask: int | None = None,
+    irma_in: int = 0,
+    irma_out: int = 0,
+    crown_count: int | None = None,
+    with_irma04: bool = False,
+    with_crown03: bool = False,
 ) -> bytes:
     extra = (0x80 if valid else 0x00) | 0x60
     payload = _NAV00_STRUCT.pack(
@@ -234,6 +324,19 @@ def build_realtime_frame(
         1,
     )
     body = bytes([CELL_NAV00, 0]) + payload
+    # Опциональные ячейки дверей для тестов/эмулятора. Явный door_mask имеет
+    # приоритет; иначе door_open=True -> маска 0x01, False -> 0x00.
+    # Без флагов with_* один door_open/door_mask даёт Crown03 по умолчанию.
+    if door_mask is None and door_open is not None:
+        door_mask = 0x01 if door_open else 0x00
+    want_crown = with_crown03 or (door_mask is not None and not with_irma04)
+    want_irma = with_irma04
+    if want_crown:
+        count = crown_count if crown_count is not None else (1 if door_mask else 0)
+        body += bytes([CELL_CROWN03, 0, int(door_mask or 0) & 0xFF, int(count) & 0xFF, 0])
+    if want_irma:
+        body += bytes([CELL_IRMA04, 0, int(door_mask or 0) & 0xFF,
+                       int(irma_in) & 0xFF, int(irma_out) & 0xFF, 0])
     nph = _NPH_STRUCT.pack(SERVICE_NAVDATA, TYPE_REALTIME, 0x0001, request_id)
     npl = _NPL_STRUCT.pack(
         SIGNATURE, len(nph) + len(body), 0, _swap16(crc16_modbus(nph + body)),

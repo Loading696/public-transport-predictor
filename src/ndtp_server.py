@@ -68,6 +68,10 @@ class NDTPReceiver:
         async with self._lock:
             return list(self._rows)
 
+    def set_tr_map(self, tr_map: dict[int, int] | None) -> None:
+        """Обновить маппинг unitId -> tr_id без перезапуска TCP-сервера."""
+        self._tr_map = dict(tr_map or {})
+
     def status(self) -> dict[str, Any]:
         return {
             "enabled": self._server is not None,
@@ -104,10 +108,18 @@ class NDTPReceiver:
                     packet = parse_realtime(npl, nph, body)
                     self.stats["realtime"] += 1
                     if packet.nav is not None:
-                        row = nav_to_telemetry(npl.peer_address, packet.nav, self._tr_map)
+                        row = nav_to_telemetry(
+                            npl.peer_address, packet.nav, self._tr_map,
+                            door_open=packet.door_open, cells=packet.cells,
+                        )
+                        # Детали дверей для витрины/отладки (не ломают схему telemetry).
+                        if packet.doors:
+                            row["doors"] = packet.doors
                         async with self._lock:
                             self._rows.append(row)
                         self.stats["rows"] += 1
+                        if packet.door_open:
+                            self.stats["door_open_frames"] = self.stats.get("door_open_frames", 0) + 1
                 else:
                     self.stats["frame_errors"] += 1
         except (ConnectionResetError, BrokenPipeError):
