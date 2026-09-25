@@ -11,8 +11,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from src.runtime import InferenceService, StreamSimulator
+from src.ndtp_server import NDTPReceiver
 
 DEFAULT_SPEED = float(os.getenv("SIMULATION_SPEED", "60"))
+TCP_PORT = int(os.getenv("TCP_PORT", "9201"))
 app = FastAPI(title="Transport Delay MVP", version="1.0.0")
 
 
@@ -99,7 +101,12 @@ KNOWN_ROUTES = [
     "/stream/status",
     "/models",
     "/v1/models",
+    "/ndtp/status",
 ]
+
+
+def _get_ndtp() -> NDTPReceiver | None:
+    return getattr(app.state, "ndtp", None)
 
 
 @app.exception_handler(404)
@@ -210,9 +217,24 @@ async def stream_status(
     return simulator.status()
 
 
+@app.get("/ndtp/status")
+async def ndtp_status() -> dict[str, Any]:
+    receiver = _get_ndtp()
+    if receiver is None:
+        return {"enabled": False, "port": TCP_PORT}
+    return receiver.status()
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     await _get_simulator()
+    try:
+        receiver = NDTPReceiver()
+        await receiver.start("0.0.0.0", TCP_PORT)
+        app.state.ndtp = receiver
+    except OSError as exc:
+        app.state.ndtp = None
+        print(f"NDTP TCP server not started on port {TCP_PORT}: {exc}", flush=True)
 
 
 @app.on_event("shutdown")
@@ -220,3 +242,6 @@ async def on_shutdown() -> None:
     simulator = getattr(app.state, "simulator", None)
     if simulator is not None:
         await simulator.stop()
+    receiver = _get_ndtp()
+    if receiver is not None:
+        await receiver.stop()
