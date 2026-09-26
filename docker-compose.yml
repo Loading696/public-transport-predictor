@@ -25,10 +25,19 @@ services:
     build:
       context: .
       dockerfile: ./dashboard/Dockerfile
+      args:
+        VITE_API_BASE: /api
+        VITE_MAP_PROVIDER: "${VITE_MAP_PROVIDER:-2gis}"
+        VITE_TWOGIS_API_KEY: "${VITE_TWOGIS_API_KEY:-}"
+        VITE_TWOGIS_LOCALE: "${VITE_TWOGIS_LOCALE:-ru_RU}"
+        VITE_YANDEX_API_KEY: "${VITE_YANDEX_API_KEY:-}"
+        VITE_GOOGLE_MAPS_API_KEY: "${VITE_GOOGLE_MAPS_API_KEY:-}"
+        VITE_DEFAULT_CENTER: "${VITE_DEFAULT_CENTER:-55.7558,37.6173}"
+        VITE_DEFAULT_ZOOM: "${VITE_DEFAULT_ZOOM:-11}"
+        VITE_POLL_INTERVAL_MS: "${VITE_POLL_INTERVAL_MS:-3000}"
+        VITE_WS_URL: "${VITE_WS_URL:-}"
     ports:
-      - "8501:8501"
-    environment:
-      BACKEND_URL: http://backend:8000
+      - "8080:80"
     depends_on:
       backend:
         condition: service_healthy

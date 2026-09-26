@@ -11,6 +11,12 @@ env/
 Pipfile.lock
 poetry.lock
 
+node_modules/
+dist/
+.env.local
+.env.*.local
+npm-debug.log*
+
 __pycache__/
 *.pyc
 .pytest_cache/
