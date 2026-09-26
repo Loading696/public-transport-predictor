@@ -28,7 +28,21 @@ BATCH_WINDOW_MS = float(os.getenv("PREDICT_BATCH_WINDOW_MS", "4"))
 # Потолок строк в одном батче, ограничивающий пиковую память фрейма признаков.
 PREDICT_BATCH_MAX_ROWS = int(os.getenv("PREDICT_BATCH_MAX_ROWS", "256"))
 
-app = FastAPI(title="Transport Delay MVP", version="1.1.0")
+app = FastAPI(
+    title="Предиктор задержек наземного транспорта — API",
+    version="1.1.0",
+    description=(
+        "Прогноз задержки ТС на горизонте 10–15 минут, каскадное "
+        "распространение по сети и приём потока телематики NDTP.\n\n"
+        "**Слои системы:** приём NDTP (TCP 9201) → признаки с причинным "
+        "срезом `event_time ≤ T` → CatBoost-регрессия + изотоническая "
+        "калибровка `P(опоздание > 120 с)` → каскад по плановой сети → "
+        "дашборд диспетчера.\n\n"
+        "**Анти-утечка:** `time_fact_begin` не читается ни одним модулем, "
+        "срез телеметрии выполняется поиском `searchsorted(..., side='right')` "
+        "по каждой точке прогноза отдельно."
+    ),
+)
 
 # Кэш прогнозов живого потока: (unit_id, event_time_iso) -> (mono_ts, forecast).
 # forecast — только прогнозная часть юнита (позиция/двери всегда свежие из строк).
@@ -191,6 +205,78 @@ class PredictRequest(BaseModel):
 
     class Config:
         extra = "ignore"
+
+
+# --------------------------------------------------------------------------- #
+# Схемы ответов (OpenAPI)
+# --------------------------------------------------------------------------- #
+
+
+class PatternEvent(BaseModel):
+    """Событие детектора паттернов, предшествующих сбою."""
+
+    type: str = Field(examples=["backlog"], description="dwell | speed_drop | backlog | stale")
+    role: str = Field(examples=["strong_signal"], description="strong_signal | weak_signal | data_quality")
+    confidence: float = Field(ge=0.0, le=1.0, description="Уверенность детектора, 0…1")
+    reason: str = Field(examples=["накопленное отставание 210 с сохраняется к цели"])
+
+
+class Prediction(BaseModel):
+    """Прогноз по одной точке."""
+
+    sample_id: str | None = Field(default=None, description="ID точки; генерируется, если не передан")
+    tr_id: int = Field(description="ID транспортного средства")
+    T: datetime | None = Field(default=None, description="Момент прогноза — граница причинного среза")
+    target_stop_id: int | None = Field(default=None, description="Целевая остановка")
+    target_time_begin: datetime | None = Field(default=None, description="Плановое прибытие на цель (в горизонте T+10…15 мин)")
+    prediction: float = Field(description="Прогноз задержки, секунды: «+» опоздание, «−» опережение")
+    p_late: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Откалиброванная P(задержка > 120 с); None, если кривая калибровки не загружена",
+    )
+    target_class: str = Field(examples=["late"], description="early | ontime | late (пороги −60 / +120 с)")
+    risk: str = Field(examples=["late"], description="on-time | at-risk | late (пороги 0 / +60 / +120 с)")
+    recommendation: str = Field(examples=["скорректировать интервал на маршруте"])
+    pattern_events: list[PatternEvent] = Field(default_factory=list, description="Сработавшие детекторы паттернов")
+
+
+class PredictResponse(BaseModel):
+    count: int = Field(description="Количество точек в ответе")
+    predictions: list[Prediction] = Field(description="Прогнозы в порядке входных точек")
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(examples=["ok"])
+    model: str = Field(description="Путь к артефакту CatBoost")
+    features: int = Field(description="Число признаков в модели")
+    validate_points: int = Field(description="Точек прогноза в validate-периоде")
+
+
+class NdtpStatusResponse(BaseModel):
+    enabled: bool = Field(description="TCP-приёмник NDTP поднят")
+    port: int | None = Field(default=None, description="Порт приёмника (9201)")
+    buffered_rows: int = Field(default=0, description="Строк телеметрии в буфере")
+    connections: int = Field(default=0, description="Активных соединений с эмулятором")
+    handshakes: int = Field(default=0, description="Успешных NPH_SGC_CONN_REQUEST")
+    realtime: int = Field(default=0, description="Пакетов NPH_SND_REALTIME принято")
+    rows: int = Field(default=0, description="Декодированных строк телеметрии")
+    crc_errors: int = Field(default=0, description="Отброшено по CRC-16/Modbus")
+    frame_errors: int = Field(default=0, description="Отброшено как некорректный кадр")
+    door_open_frames: int = Field(default=0, description="Кадров с зафиксированным состоянием дверей")
+
+
+class SubmissionResponse(BaseModel):
+    path: str = Field(description="Куда записан submission.csv")
+    rows: int = Field(description="Строк в файле")
+    first_rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ModelInfoResponse(BaseModel):
+    model: str = Field(description="Путь к артефакту CatBoost")
+    features: int
+    validate_points: int
 
 
 def _dump(value: Any) -> Any:
@@ -544,7 +630,12 @@ def favicon() -> Response:
     return Response(status_code=204)
 
 
-@app.get("/models")
+@app.get(
+    "/models",
+    response_model=ModelInfoResponse,
+    summary="Метаданные загруженной модели",
+    tags=["model"],
+)
 def models() -> dict[str, Any]:
     runtime = _get_runtime()
     return {
@@ -554,7 +645,11 @@ def models() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/models")
+@app.get(
+    "/v1/models",
+    summary="Листинг модели в формате OpenAI-совместимого API",
+    tags=["model"],
+)
 def v1_models() -> dict[str, Any]:
     info = models()
     return {
@@ -570,12 +665,17 @@ def v1_models() -> dict[str, Any]:
     }
 
 
-@app.get("/")
+@app.get("/", summary="Название сервиса и ссылка на документацию", tags=["service"])
 def root() -> dict[str, str]:
     return {"service": app.title, "docs": "/docs"}
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Проверка готовности (healthcheck Docker)",
+    tags=["service"],
+)
 async def health() -> dict[str, Any]:
     """Healthcheck: must stay cheap, so nothing heavy is warmed up here."""
     try:
@@ -590,7 +690,16 @@ async def health() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.post("/predict")
+@app.post(
+    "/predict",
+    response_model=PredictResponse,
+    summary="Пакетный прогноз задержки",
+    tags=["prediction"],
+    responses={
+        400: {"description": "Некорректные точки прогноза или телеметрия"},
+        500: {"description": "Внутренняя ошибка инференса"},
+    },
+)
 async def predict(payload: Annotated[Any, Body()]) -> dict[str, Any]:
     """Batch prediction endpoint.
 
@@ -616,7 +725,12 @@ async def predict(payload: Annotated[Any, Body()]) -> dict[str, Any]:
     return {"count": len(predictions), "predictions": predictions}
 
 
-@app.post("/generate_submission")
+@app.post(
+    "/generate_submission",
+    response_model=SubmissionResponse,
+    summary="Пересчитать submission.csv по validate-периоду",
+    tags=["prediction"],
+)
 async def generate_submission() -> dict[str, Any]:
     batcher = await _get_batcher()
     started = time.perf_counter()
@@ -633,7 +747,12 @@ async def generate_submission() -> dict[str, Any]:
     return payload
 
 
-@app.get("/generate_submission")
+@app.get(
+    "/generate_submission",
+    response_model=SubmissionResponse,
+    summary="То же, что POST /generate_submission (удобно из браузера)",
+    tags=["prediction"],
+)
 async def generate_submission_get() -> dict[str, Any]:
     return await generate_submission()
 
@@ -665,10 +784,20 @@ def _build_submission(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-@app.get("/stream/status")
+@app.get(
+    "/stream/status",
+    summary="Состояние витрины: прогнозы, позиции, инцидент, живой поток",
+    tags=["dashboard"],
+    response_description=(
+        "Единый снимок для дашборда: `vehicles` — прогнозы, `map.routes` / "
+        "`map.positions` — отрисовка карты, `map.incident` — карточка "
+        "инцидента, `live_units` — NDTP-юниты, `batching` — эффективность "
+        "микробатчинга."
+    ),
+)
 async def stream_status(
-    speed: float | None = Query(default=None, gt=0),
-    reset: bool = Query(default=False),
+    speed: float | None = Query(default=None, gt=0, description="Ускорение реплея, ×реальное время"),
+    reset: bool = Query(default=False, description="Перезапустить поток с начала"),
 ) -> dict[str, Any]:
     """Replay dashboard feed.
 
@@ -690,7 +819,12 @@ async def stream_status(
     return data
 
 
-@app.get("/ndtp/status")
+@app.get(
+    "/ndtp/status",
+    response_model=NdtpStatusResponse,
+    summary="Счётчики TCP-приёмника NDTP (9201)",
+    tags=["telemetry"],
+)
 async def ndtp_status() -> dict[str, Any]:
     receiver = _get_ndtp()
     if receiver is None:
@@ -698,7 +832,11 @@ async def ndtp_status() -> dict[str, Any]:
     return receiver.status()
 
 
-@app.get("/cascade")
+@app.get(
+    "/cascade",
+    summary="Каскадное распространение задержки по плановой сети",
+    tags=["prediction"],
+)
 async def cascade() -> dict[str, Any]:
     """Cascading-delay view of the planned route network.
 
@@ -719,7 +857,11 @@ async def cascade() -> dict[str, Any]:
     return payload
 
 
-@app.get("/metrics")
+@app.get(
+    "/metrics",
+    summary="Метрики времени выполнения и эффективности батчинга",
+    tags=["service"],
+)
 async def metrics() -> dict[str, Any]:
     """Runtime counters: per-endpoint latency, inference time, batching efficiency."""
     payload = await METRICS.snapshot()

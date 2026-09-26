@@ -1,9 +1,18 @@
 *.tar
-*.csv
 *.zip
-dataset/
 *.tar.gz
 *.parquet
+
+# Приватные данные хакатона не попадают в публичный репозиторий.
+# Исключение -- validate-период: он нужен жюри, чтобы запустить стенд
+# одной командой и увидеть работающий дашборд.
+dataset/*
+!dataset/validate/
+!dataset/validate/*.csv
+
+# Прочие csv (train/test/labels, submission.csv) -- локально и в .gitignore
+*.csv
+!dataset/validate/*.csv
 
 venv/
 .venv/
@@ -16,6 +25,9 @@ dist/
 .env.local
 .env.*.local
 npm-debug.log*
+
+# Сборка Sphinx (исходники документации в docs/ коммитятся)
+docs/_build/
 
 __pycache__/
 *.pyc
