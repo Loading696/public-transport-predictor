@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>src.runtime &#8212; Предиктор задержек наземного транспорта 1.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=fc837d61"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="src.ndtp" href="src.ndtp.html" />
+    <link rel="prev" title="src.batching" href="src.batching.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="module-src.runtime">
+<span id="src-runtime"></span><h1>src.runtime<a class="headerlink" href="#module-src.runtime" title="Link to this heading">¶</a></h1>
+<dl class="py function">
+<dt class="sig sig-object py" id="src.runtime.target_class_for">
+<span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">target_class_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">delay_s</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#target_class_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.target_class_for" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="src.runtime.risk_for">
+<span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">risk_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">delay_s</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#risk_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.risk_for" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="src.runtime.recommendation_for">
+<span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">recommendation_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">delay_s</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#recommendation_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.recommendation_for" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="src.runtime.LIVE_TARGET_MIN_S">
+<span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">LIVE_TARGET_MIN_S</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">600</span></span><a class="headerlink" href="#src.runtime.LIVE_TARGET_MIN_S" title="Link to this definition">¶</a></dt>
+<dd><p>Target window for live units, mirroring the horizon the model was trained on
+(<code class="docutils literal notranslate"><span class="pre">lead_minus_660</span> <span class="pre">=</span> <span class="pre">lead_s</span> <span class="pre">-</span> <span class="pre">660</span></code> in the feature list).  Used by the live
+target search and kept here so the service and the cascade agree.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="src.runtime.cause_from_events">
+<span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">cause_from_events</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">events</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#tuple" title="(in Python v3.14)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#cause_from_events"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.cause_from_events" title="Link to this definition">¶</a></dt>
+<dd><p>Pick the incident cause from pattern events: data quality first, then strong signal.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="src.runtime.InferenceService">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">InferenceService</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/pathlib.html#pathlib.Path" title="(in Python v3.14)"><span class="pre">Path</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">dataset_dir</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/pathlib.html#pathlib.Path" title="(in Python v3.14)"><span class="pre">Path</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/pathlib.html#pathlib.Path" title="(in Python v3.14)"><span class="pre">Path</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">features_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/pathlib.html#pathlib.Path" title="(in Python v3.14)"><span class="pre">Path</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/src/runtime.html#InferenceService"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService" title="Link to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3/builtins/functions.html#object" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.cascade_engine">
+<span class="sig-name descname"><span class="pre">cascade_engine</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="src.cascade.html#src.cascade.CascadeEngine" title="src.cascade.CascadeEngine"><span class="pre">CascadeEngine</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.cascade_engine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.cascade_engine" title="Link to this definition">¶</a></dt>
+<dd><p>Return the cascade engine, building the route graph on first call.</p>
+<p>The graph is derived from the <em>plan</em> only (<code class="docutils literal notranslate"><span class="pre">time_begin</span></code>), never from
+<code class="docutils literal notranslate"><span class="pre">time_fact_begin</span></code>, so it is safe for the live and validate contours.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.p_late_for">
+<span class="sig-name descname"><span class="pre">p_late_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">delay_s</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.p_late_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.p_late_for" title="Link to this definition">¶</a></dt>
+<dd><p>Calibrated P(delay &gt; 120s) for a point prediction; None without curve.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.predict_frame">
+<span class="sig-name descname"><span class="pre">predict_frame</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html#pandas.DataFrame" title="(in pandas v3.0.6)"><span class="pre">DataFrame</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.14)"><span class="pre">Iterable</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">traffic</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html#pandas.DataFrame" title="(in pandas v3.0.6)"><span class="pre">DataFrame</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.14)"><span class="pre">Iterable</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html#pandas.DataFrame" title="(in pandas v3.0.6)"><span class="pre">DataFrame</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.predict_frame"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.predict_frame" title="Link to this definition">¶</a></dt>
+<dd><p>Predict for a set of points and post-process the model output.</p>
+<p>Batching note: passing many points with different <code class="docutils literal notranslate"><span class="pre">T</span></code> is <em>safe</em> and
+is the intended usage.  The causal cut is applied per point inside
+<code class="xref py py-func docutils literal notranslate"><span class="pre">src.predictor._vehicle_telemetry_features()</span></code> via
+<code class="docutils literal notranslate"><span class="pre">searchsorted(times,</span> <span class="pre">T,</span> <span class="pre">'right')</span></code>; the <code class="docutils literal notranslate"><span class="pre">max_time</span></code> filter below is
+only a coarse pre-trim to the largest <code class="docutils literal notranslate"><span class="pre">T</span></code> in the batch.  Equivalence
+between single-row and batched prediction is asserted in
+<code class="docutils literal notranslate"><span class="pre">ml/test_batching.py</span></code> (max abs difference 0.0).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.live_target">
+<span class="sig-name descname"><span class="pre">live_target</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tr_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">event_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#tuple" title="(in Python v3.14)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.live_target"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.live_target" title="Link to this definition">¶</a></dt>
+<dd><p>First planned stop whose arrival falls in <code class="docutils literal notranslate"><span class="pre">(T+600,</span> <span class="pre">T+900]</span></code>.</p>
+<p>O(log n) per call: binary search on the pre-indexed arrival times of the
+vehicle.  Mirrors the previous pandas implementation exactly, including
+the <code class="docutils literal notranslate"><span class="pre">no_schedule</span></code> / <code class="docutils literal notranslate"><span class="pre">no_time</span></code> / <code class="docutils literal notranslate"><span class="pre">out_of_horizon</span></code> statuses that the
+live UI renders verbatim.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.schedule_for">
+<span class="sig-name descname"><span class="pre">schedule_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tr_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html#pandas.DataFrame" title="(in pandas v3.0.6)"><span class="pre">DataFrame</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.schedule_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.schedule_for" title="Link to this definition">¶</a></dt>
+<dd><p>Planned timetable of one vehicle, from the pre-computed index.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.predict_records">
+<span class="sig-name descname"><span class="pre">predict_records</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.14)"><span class="pre">Iterable</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shared_telemetry</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.14)"><span class="pre">Iterable</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">with_cascade</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.14)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.predict_records"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.predict_records" title="Link to this definition">¶</a></dt>
+<dd><p>Predict for a batch of points and optionally project ETAs forward.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>points</strong> (<em>iterable</em><em> of </em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><em>dict</em></a>) – Forecast points; a point may carry its own <code class="docutils literal notranslate"><span class="pre">telemetry</span></code> list.</p></li>
+<li><p><strong>shared_telemetry</strong> (<em>iterable</em><em> of </em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><em>dict</em></a><em>, </em><em>optional</em>) – Telemetry shared by every point in the batch.</p></li>
+<li><p><strong>with_cascade</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.14)"><em>bool</em></a>) – When true (default) each record gains an <code class="docutils literal notranslate"><span class="pre">eta_projection</span></code> list: the
+per-stop ETA the cascade model expects from <code class="docutils literal notranslate"><span class="pre">target_stop_id</span></code>
+onwards.  Set false to skip it on hot paths that only need the point
+prediction.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Prediction records in the input order.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.14)">list</a> of <a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.cascade_snapshot">
+<span class="sig-name descname"><span class="pre">cascade_snapshot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vehicles</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.14)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.cascade_snapshot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.cascade_snapshot" title="Link to this definition">¶</a></dt>
+<dd><p>Solve the network cascade for the current fleet state.</p>
+<p>Each vehicle’s predicted delay at its target stop becomes an injection at
+the matching graph vertex; a detected <code class="docutils literal notranslate"><span class="pre">dwell</span></code> event becomes a nuisance
+source on that stop.  The returned payload is the JSON-ready summary plus
+a per-route projection of the first <code class="docutils literal notranslate"><span class="pre">cascade_horizon</span></code> stops.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>vehicles</strong> (<em>mapping</em>) – <code class="docutils literal notranslate"><span class="pre">tr_id</span> <span class="pre">-&gt;</span> <span class="pre">record</span></code> as held by the stream simulator.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">{&quot;enabled&quot;:</span> <span class="pre">bool,</span> <span class="pre">...}</span></code>.  <code class="docutils literal notranslate"><span class="pre">enabled</span></code> is false when the plan could
+not be turned into a graph (no schedule rows, no geometry) – the
+rest of the service keeps working, it simply has no cascade view.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.generate_submission">
+<span class="sig-name descname"><span class="pre">generate_submission</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">output_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/pathlib.html#pathlib.Path" title="(in Python v3.14)"><span class="pre">Path</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.generate_submission"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.generate_submission" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.InferenceService.stream_simulator">
+<span class="sig-name descname"><span class="pre">stream_simulator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">speed</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">60.0</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#src.runtime.StreamSimulator" title="src.runtime.StreamSimulator"><span class="pre">StreamSimulator</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#InferenceService.stream_simulator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.InferenceService.stream_simulator" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">src.runtime.</span></span><span class="sig-name descname"><span class="pre">StreamSimulator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">service</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#src.runtime.InferenceService" title="src.runtime.InferenceService"><span class="pre">InferenceService</span></a></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">speed</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">60.0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator" title="Link to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3/builtins/functions.html#object" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.set_speed">
+<span class="sig-name descname"><span class="pre">set_speed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">speed</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.set_speed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.set_speed" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.reset">
+<span class="sig-name descname"><span class="pre">reset</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">speed</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.14)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.reset"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.reset" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.start">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">start</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.start"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.start" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.stop">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">stop</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.stop" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.advance_to">
+<span class="sig-name descname"><span class="pre">advance_to</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">target_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://pandas.pydata.org/docs/reference/api/pandas.Timestamp.html#pandas.Timestamp" title="(in pandas v3.0.6)"><span class="pre">Timestamp</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.14)"><span class="pre">None</span></a></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.advance_to"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.advance_to" title="Link to this definition">¶</a></dt>
+<dd><p>Advance the replay clock, ingesting telemetry and scoring points.</p>
+<p>Forecast points that fall due in the same tick are scored in <strong>one
+batch</strong> rather than one call per point.  That is the single largest
+latency win in the replay path: feature building carries a large fixed
+cost per call (schedule lookup, telemetry slicing, dataframe merge), so
+a 10-point tick costs about the same as a 1-point tick.  The batch is
+causally sound because the per-point <code class="docutils literal notranslate"><span class="pre">event_time</span> <span class="pre">&lt;=</span> <span class="pre">T</span></code> cut happens
+inside the feature builder, not here.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.cascade_view">
+<span class="sig-name descname"><span class="pre">cascade_view</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.cascade_view"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.cascade_view" title="Link to this definition">¶</a></dt>
+<dd><p>Return the network cascade view, re-solving only when the fleet moved.</p>
+<p>The replay loop ticks ten times a second while the fleet changes only when
+a new forecast point is reached, so the solve is gated behind a dirty flag
+to keep <code class="docutils literal notranslate"><span class="pre">/stream/status</span></code> cheap.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="src.runtime.StreamSimulator.status">
+<span class="sig-name descname"><span class="pre">status</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="_modules/src/runtime.html#StreamSimulator.status"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#src.runtime.StreamSimulator.status" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Предиктор задержек наземного транспорта</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Ядро</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="src.predictor.html">src.predictor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="src.patterns.html">src.patterns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="src.cascade.html">src.cascade</a></li>
+<li class="toctree-l1"><a class="reference internal" href="src.batching.html">src.batching</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">src.runtime</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.target_class_for"><code class="docutils literal notranslate"><span class="pre">target_class_for()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.risk_for"><code class="docutils literal notranslate"><span class="pre">risk_for()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.recommendation_for"><code class="docutils literal notranslate"><span class="pre">recommendation_for()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.LIVE_TARGET_MIN_S"><code class="docutils literal notranslate"><span class="pre">LIVE_TARGET_MIN_S</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.cause_from_events"><code class="docutils literal notranslate"><span class="pre">cause_from_events()</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.InferenceService"><code class="docutils literal notranslate"><span class="pre">InferenceService</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#src.runtime.StreamSimulator"><code class="docutils literal notranslate"><span class="pre">StreamSimulator</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="src.ndtp.html">src.ndtp</a></li>
+<li class="toctree-l1"><a class="reference internal" href="src.ndtp_server.html">src.ndtp_server</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="src.batching.html" title="previous chapter">src.batching</a></li>
+      <li>Next: <a href="src.ndtp.html" title="next chapter">src.ndtp</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/src.runtime.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
