@@ -1,0 +1,54 @@
+{
+  "targetHost": "host.docker.internal",
+  "targetPort": 9201,
+  "units": [
+    {
+      "unitId": 1166336,
+      "intervalMs": 5000,
+      "autoGenerate": true,
+      "cells": [
+        {
+          "type": "G6CellNav00"
+        },
+        {
+          "type": "G6CellCrown03",
+          "fields": {
+            "odometer": 123456,
+            "zone": 1,
+            "corona_door_in1": 5,
+            "corona_door_out1": 3,
+            "corona_door_in2": 0,
+            "corona_door_out2": 0,
+            "corona_door_in3": 0,
+            "corona_door_out3": 0,
+            "corona_door_in4": 0,
+            "corona_door_out4": 0
+          }
+        },
+        {
+          "type": "G6CellIrma04",
+          "fields": {
+            "odometer": 123456,
+            "zone": 1,
+            "irma_door_in1": 5,
+            "irma_door_out1": 3,
+            "irma_door_in2": 0,
+            "irma_door_out2": 0,
+            "irma_door_in3": 0,
+            "irma_door_out3": 0,
+            "irma_door_in4": 0,
+            "irma_door_out4": 0,
+            "irma_present_door1": 1,
+            "irma_closed_door1": 0,
+            "irma_present_door2": 1,
+            "irma_closed_door2": 1,
+            "irma_present_door3": 1,
+            "irma_closed_door3": 1,
+            "irma_present_door4": 1,
+            "irma_closed_door4": 1
+          }
+        }
+      ]
+    }
+  ]
+}
