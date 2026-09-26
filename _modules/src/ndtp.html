@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>src.ndtp &#8212; Предиктор задержек наземного транспорта 1.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="../../_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="../../_static/alabaster.css?v=27fed22d" />
+    <script src="../../_static/documentation_options.js?v=fc837d61"></script>
+    <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+   
+  <link rel="stylesheet" href="../../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for src.ndtp</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot;NDTP protocol parser (client -&gt; server direction).</span>
+
+<span class="sd">Implements the framing from dataset/docs/Emulator-and-Telematic-Packets-Specification.md:</span>
+<span class="sd">  [ NPL 15 bytes ][ NPH 10 bytes ][ body ], little-endian, packed.</span>
+
+<span class="sd">  - NPL: u16 signature (0x7E7E), u16 dataSize (NPH+body), u16 flags,</span>
+<span class="sd">         u16 crc (CRC-16/Modbus over NPH+body, bytes swapped),</span>
+<span class="sd">         u8 type (0x02 = NPH), u32 peerAddress (unitId), u16 requestId.</span>
+<span class="sd">  - NPH: u16 serviceId, u16 type, u16 flags, u32 requestId.</span>
+<span class="sd">  - Handshake NPH_SGC_CONN_REQUEST (service 0 / type 100): 18-byte body.</span>
+<span class="sd">  - Realtime NPH_SND_REALTIME (service 1 / type 101): cell sequence</span>
+<span class="sd">    [type u8][number u8][payload], G6CellNav00 (type 0, 26 bytes) first.</span>
+
+<span class="sd">Only the navigation cell is decoded into telemetry rows; other known cells</span>
+<span class="sd">are carried as raw payload, unknown cell types stop cell parsing.</span>
+<span class="sd">Door cells Crown03 (type 3) / Irma04 (type 4) are decoded best-effort into</span>
+<span class="sd">door_open (ASSUMPTION, verified=False — binary layouts are NOT in the spec,</span>
+<span class="sd">see the comment block above CELL_CROWN03).</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span><span class="p">,</span> <span class="n">timezone</span>
+
+<span class="n">SIGNATURE</span> <span class="o">=</span> <span class="mh">0x7E7E</span>
+<span class="n">NPL_SIZE</span> <span class="o">=</span> <span class="mi">15</span>
+<span class="n">NPH_SIZE</span> <span class="o">=</span> <span class="mi">10</span>
+<span class="n">NPL_TYPE_NPH</span> <span class="o">=</span> <span class="mh">0x02</span>
+
+<span class="n">SERVICE_HANDSHAKE</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="n">TYPE_CONN_REQUEST</span> <span class="o">=</span> <span class="mi">100</span>
+<span class="n">SERVICE_NAVDATA</span> <span class="o">=</span> <span class="mi">1</span>
+<span class="n">TYPE_REALTIME</span> <span class="o">=</span> <span class="mi">101</span>
+
+<span class="n">CELL_NAV00</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="n">NAV00_PAYLOAD</span> <span class="o">=</span> <span class="mi">26</span>
+
+<span class="c1"># Ячейки дверей. Эталон — GET /api/cells живого эмулятора (имена/типы полей),</span>
+<span class="c1"># md-спека бинарных layout&#39;ов не даёт. Выводы из эталона:</span>
+<span class="c1">#   - дискриминатор в cells[] — СТРОКА класса (&quot;G6CellCrown03&quot;), число 4</span>
+<span class="c1">#     эмулятор отвергает 400 &quot;Unknown cell type: 4&quot; (проверено живьём);</span>
+<span class="c1">#   - Crown03 (type 3): 8x u8 счётчики (in1..4, out1..4 в порядке эталона)</span>
+<span class="c1">#     + u32 odometer + u16 zone = 14 байт. Порядок полей — как в /api/cells;</span>
+<span class="c1">#   - Irma04 (type 4): все поля BitField без раскрытых ширин — надёжно</span>
+<span class="c1">#     распарсить нельзя: из CELL_SIZES убрана, захватывается raw для анализа.</span>
+<span class="c1"># door_open (Crown): True если хоть один счётчик in/out ненулевой</span>
+<span class="c1"># (движение через двери), иначе False; без дверных ячеек — None.</span>
+<span class="n">CELL_CROWN03</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="n">CROWN03_PAYLOAD</span> <span class="o">=</span> <span class="mi">14</span>
+<span class="n">CELL_IRMA04</span> <span class="o">=</span> <span class="mi">4</span>
+
+<span class="n">CELL_SIZES</span> <span class="o">=</span> <span class="p">{</span><span class="mi">0</span><span class="p">:</span> <span class="mi">26</span><span class="p">,</span> <span class="mi">2</span><span class="p">:</span> <span class="mi">26</span><span class="p">,</span> <span class="mi">3</span><span class="p">:</span> <span class="mi">14</span><span class="p">,</span> <span class="mi">8</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">10</span><span class="p">:</span> <span class="mi">37</span><span class="p">,</span> <span class="mi">16</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">15</span><span class="p">:</span> <span class="mi">50</span><span class="p">}</span>
+
+<span class="n">_NPL_STRUCT</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">Struct</span><span class="p">(</span><span class="s2">&quot;&lt;HHHHBIH&quot;</span><span class="p">)</span>
+<span class="n">_NPH_STRUCT</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">Struct</span><span class="p">(</span><span class="s2">&quot;&lt;HHHI&quot;</span><span class="p">)</span>
+<span class="n">_HANDSHAKE_STRUCT</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">Struct</span><span class="p">(</span><span class="s2">&quot;&lt;HHHIII&quot;</span><span class="p">)</span>
+<span class="n">_NAV00_STRUCT</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">Struct</span><span class="p">(</span><span class="s2">&quot;&lt;III BBHHHHHBB&quot;</span><span class="p">)</span>
+<span class="n">_CROWN03_STRUCT</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">Struct</span><span class="p">(</span><span class="s2">&quot;&lt;BBBBBBBBIH&quot;</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="NDTPError">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.NDTPError">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">NDTPError</span><span class="p">(</span><span class="ne">ValueError</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Malformed NDTP frame or failed integrity check.&quot;&quot;&quot;</span></div>
+
+
+
+<div class="viewcode-block" id="crc16_modbus">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.crc16_modbus">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">crc16_modbus</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="n">crc</span> <span class="o">=</span> <span class="mh">0xFFFF</span>
+    <span class="k">for</span> <span class="n">byte</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
+        <span class="n">crc</span> <span class="o">^=</span> <span class="n">byte</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">):</span>
+            <span class="n">crc</span> <span class="o">=</span> <span class="p">((</span><span class="n">crc</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="o">^</span> <span class="mh">0xA001</span><span class="p">)</span> <span class="k">if</span> <span class="p">(</span><span class="n">crc</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="p">(</span><span class="n">crc</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">crc</span> <span class="o">&amp;</span> <span class="mh">0xFFFF</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_swap16</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">return</span> <span class="p">((</span><span class="n">value</span> <span class="o">&amp;</span> <span class="mh">0xFF</span><span class="p">)</span> <span class="o">&lt;&lt;</span> <span class="mi">8</span><span class="p">)</span> <span class="o">|</span> <span class="p">((</span><span class="n">value</span> <span class="o">&gt;&gt;</span> <span class="mi">8</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFF</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="NPLHeader">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.NPLHeader">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NPLHeader</span><span class="p">:</span>
+    <span class="n">signature</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">data_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">flags</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">crc</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">pkt_type</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">peer_address</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="NPHHeader">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.NPHHeader">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NPHHeader</span><span class="p">:</span>
+    <span class="n">service_id</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">pkt_type</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">flags</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="RealtimePacket">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.RealtimePacket">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RealtimePacket</span><span class="p">:</span>
+    <span class="n">npl</span><span class="p">:</span> <span class="n">NPLHeader</span>
+    <span class="n">nph</span><span class="p">:</span> <span class="n">NPHHeader</span>
+    <span class="n">nav</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">cells</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">doors</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">door_open</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="parse_npl">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.parse_npl">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_npl</span><span class="p">(</span><span class="n">raw</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NPLHeader</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NPL_SIZE</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;NPL must be </span><span class="si">{</span><span class="n">NPL_SIZE</span><span class="si">}</span><span class="s2"> bytes, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">signature</span><span class="p">,</span> <span class="n">data_size</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">crc</span><span class="p">,</span> <span class="n">pkt_type</span><span class="p">,</span> <span class="n">peer</span><span class="p">,</span> <span class="n">request_id</span> <span class="o">=</span> <span class="n">_NPL_STRUCT</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">signature</span> <span class="o">!=</span> <span class="n">SIGNATURE</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;bad signature 0x</span><span class="si">{</span><span class="n">signature</span><span class="si">:</span><span class="s2">04X</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">pkt_type</span> <span class="o">!=</span> <span class="n">NPL_TYPE_NPH</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;unsupported NPL type 0x</span><span class="si">{</span><span class="n">pkt_type</span><span class="si">:</span><span class="s2">02X</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">NPLHeader</span><span class="p">(</span><span class="n">signature</span><span class="p">,</span> <span class="n">data_size</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">crc</span><span class="p">,</span> <span class="n">pkt_type</span><span class="p">,</span> <span class="n">peer</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="parse_nph">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.parse_nph">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_nph</span><span class="p">(</span><span class="n">raw</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NPHHeader</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NPH_SIZE</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;NPH must be </span><span class="si">{</span><span class="n">NPH_SIZE</span><span class="si">}</span><span class="s2"> bytes, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">service_id</span><span class="p">,</span> <span class="n">pkt_type</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">request_id</span> <span class="o">=</span> <span class="n">_NPH_STRUCT</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">NPHHeader</span><span class="p">(</span><span class="n">service_id</span><span class="p">,</span> <span class="n">pkt_type</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="verify_crc">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.verify_crc">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">verify_crc</span><span class="p">(</span><span class="n">npl</span><span class="p">:</span> <span class="n">NPLHeader</span><span class="p">,</span> <span class="n">nph_and_body</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">expected</span> <span class="o">=</span> <span class="n">_swap16</span><span class="p">(</span><span class="n">crc16_modbus</span><span class="p">(</span><span class="n">nph_and_body</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">expected</span> <span class="o">!=</span> <span class="n">npl</span><span class="o">.</span><span class="n">crc</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;CRC mismatch for unit </span><span class="si">{</span><span class="n">npl</span><span class="o">.</span><span class="n">peer_address</span><span class="si">}</span><span class="s2">: &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;got 0x</span><span class="si">{</span><span class="n">npl</span><span class="o">.</span><span class="n">crc</span><span class="si">:</span><span class="s2">04X</span><span class="si">}</span><span class="s2">, want 0x</span><span class="si">{</span><span class="n">expected</span><span class="si">:</span><span class="s2">04X</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="decode_nav00">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.decode_nav00">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">decode_nav00</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NAV00_PAYLOAD</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Nav00 payload must be </span><span class="si">{</span><span class="n">NAV00_PAYLOAD</span><span class="si">}</span><span class="s2"> bytes, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="p">(</span><span class="n">ts</span><span class="p">,</span> <span class="n">lon_raw</span><span class="p">,</span> <span class="n">lat_raw</span><span class="p">,</span> <span class="n">extra</span><span class="p">,</span> <span class="n">bat</span><span class="p">,</span> <span class="n">sp_avg</span><span class="p">,</span> <span class="n">sp_max</span><span class="p">,</span> <span class="n">course</span><span class="p">,</span> <span class="n">track</span><span class="p">,</span> <span class="n">alt</span><span class="p">,</span> <span class="n">nsat</span><span class="p">,</span> <span class="n">pdop</span><span class="p">)</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="n">_NAV00_STRUCT</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">lon</span> <span class="o">=</span> <span class="n">lon_raw</span> <span class="o">/</span> <span class="mf">1e7</span> <span class="o">*</span> <span class="p">(</span><span class="mf">1.0</span> <span class="k">if</span> <span class="p">(</span><span class="n">extra</span> <span class="o">&gt;&gt;</span> <span class="mi">6</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mi">1</span> <span class="k">else</span> <span class="o">-</span><span class="mf">1.0</span><span class="p">)</span>
+    <span class="n">lat</span> <span class="o">=</span> <span class="n">lat_raw</span> <span class="o">/</span> <span class="mf">1e7</span> <span class="o">*</span> <span class="p">(</span><span class="mf">1.0</span> <span class="k">if</span> <span class="p">(</span><span class="n">extra</span> <span class="o">&gt;&gt;</span> <span class="mi">5</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mi">1</span> <span class="k">else</span> <span class="o">-</span><span class="mf">1.0</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;timestamp&quot;</span><span class="p">:</span> <span class="n">ts</span><span class="p">,</span>
+        <span class="s2">&quot;lon&quot;</span><span class="p">:</span> <span class="n">lon</span><span class="p">,</span>
+        <span class="s2">&quot;lat&quot;</span><span class="p">:</span> <span class="n">lat</span><span class="p">,</span>
+        <span class="s2">&quot;location_valid&quot;</span><span class="p">:</span> <span class="nb">bool</span><span class="p">((</span><span class="n">extra</span> <span class="o">&gt;&gt;</span> <span class="mi">7</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">),</span>
+        <span class="s2">&quot;extra&quot;</span><span class="p">:</span> <span class="n">extra</span><span class="p">,</span>
+        <span class="s2">&quot;bat_voltage_mv&quot;</span><span class="p">:</span> <span class="n">bat</span> <span class="o">*</span> <span class="mi">20</span><span class="p">,</span>
+        <span class="s2">&quot;speed_avg&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">sp_avg</span><span class="p">),</span>
+        <span class="s2">&quot;speed_max&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">sp_max</span><span class="p">),</span>
+        <span class="s2">&quot;course&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">course</span><span class="p">),</span>
+        <span class="s2">&quot;track_m&quot;</span><span class="p">:</span> <span class="n">track</span><span class="p">,</span>
+        <span class="s2">&quot;alt&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">alt</span><span class="p">),</span>
+        <span class="s2">&quot;nsat&quot;</span><span class="p">:</span> <span class="n">nsat</span><span class="p">,</span>
+        <span class="s2">&quot;pdop&quot;</span><span class="p">:</span> <span class="n">pdop</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="decode_crown03">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.decode_crown03">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">decode_crown03</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Crown03: 8 счётчиков in/out (u8) + odometer (u32) + zone (u16).</span>
+
+<span class="sd">    Layout выведен из GET /api/cells (типы/порядок полей), подтверждён живым</span>
+<span class="sd">    захватом. door_open=True при ненулевом движении через любую дверь.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span> <span class="o">!=</span> <span class="n">CROWN03_PAYLOAD</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Crown03 payload must be </span><span class="si">{</span><span class="n">CROWN03_PAYLOAD</span><span class="si">}</span><span class="s2"> bytes, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">parts</span> <span class="o">=</span> <span class="n">_CROWN03_STRUCT</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="nb">bytes</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+    <span class="n">counters</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">[:</span><span class="mi">8</span><span class="p">]]</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;cell&quot;</span><span class="p">:</span> <span class="s2">&quot;Crown03&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;cell_type&quot;</span><span class="p">:</span> <span class="n">CELL_CROWN03</span><span class="p">,</span>
+        <span class="s2">&quot;in&quot;</span><span class="p">:</span> <span class="n">counters</span><span class="p">[:</span><span class="mi">4</span><span class="p">],</span>
+        <span class="s2">&quot;out&quot;</span><span class="p">:</span> <span class="n">counters</span><span class="p">[</span><span class="mi">4</span><span class="p">:],</span>
+        <span class="s2">&quot;odometer&quot;</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">8</span><span class="p">]),</span>
+        <span class="s2">&quot;zone&quot;</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">9</span><span class="p">]),</span>
+        <span class="s2">&quot;door_open&quot;</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="nb">any</span><span class="p">(</span><span class="n">counters</span><span class="p">)),</span>
+        <span class="s2">&quot;verified&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="s2">&quot;raw&quot;</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="doors_from_cells">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.doors_from_cells">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">doors_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Выделить дверные ячейки; Irma04 — только raw (layout неизвестен).&quot;&quot;&quot;</span>
+    <span class="n">doors</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">cell_type</span><span class="p">,</span> <span class="n">number</span><span class="p">,</span> <span class="n">payload</span> <span class="ow">in</span> <span class="n">cells</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">cell_type</span> <span class="o">==</span> <span class="n">CELL_CROWN03</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">info</span> <span class="o">=</span> <span class="n">decode_crown03</span><span class="p">(</span><span class="nb">bytes</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+            <span class="k">except</span> <span class="n">NDTPError</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">info</span><span class="p">[</span><span class="s2">&quot;number&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">number</span>
+            <span class="n">doors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">cell_type</span> <span class="o">==</span> <span class="n">CELL_IRMA04</span><span class="p">:</span>
+            <span class="n">doors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="p">{</span>
+                    <span class="s2">&quot;cell&quot;</span><span class="p">:</span> <span class="s2">&quot;Irma04&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;cell_type&quot;</span><span class="p">:</span> <span class="n">CELL_IRMA04</span><span class="p">,</span>
+                    <span class="s2">&quot;number&quot;</span><span class="p">:</span> <span class="n">number</span><span class="p">,</span>
+                    <span class="s2">&quot;door_open&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+                    <span class="s2">&quot;verified&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                    <span class="s2">&quot;raw&quot;</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+                <span class="p">}</span>
+            <span class="p">)</span>
+    <span class="k">return</span> <span class="n">doors</span></div>
+
+
+
+<div class="viewcode-block" id="door_open_from_cells">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.door_open_from_cells">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">door_open_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Агрегированный статус дверей; None если данных нет.&quot;&quot;&quot;</span>
+    <span class="n">doors</span> <span class="o">=</span> <span class="n">doors_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">)</span>
+    <span class="n">known</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="p">[</span><span class="s2">&quot;door_open&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">doors</span> <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;door_open&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">known</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="nb">any</span><span class="p">(</span><span class="n">known</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="parse_cells">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.parse_cells">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_cells</span><span class="p">(</span><span class="n">body</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">,</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Split a realtime body into [(type, number, payload)] and decoded Nav00.</span>
+
+<span class="sd">    Unknown cell type: trailing bytes are captured as (type, number, rest)</span>
+<span class="sd">    for forensics (e.g. Irma04 whose packing is undisclosed), then stop.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">cells</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">nav</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">pos</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">while</span> <span class="n">pos</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">&lt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">):</span>
+        <span class="n">cell_type</span><span class="p">,</span> <span class="n">number</span> <span class="o">=</span> <span class="n">body</span><span class="p">[</span><span class="n">pos</span><span class="p">],</span> <span class="n">body</span><span class="p">[</span><span class="n">pos</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+        <span class="n">size</span> <span class="o">=</span> <span class="n">CELL_SIZES</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">cell_type</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cells</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">cell_type</span><span class="p">,</span> <span class="n">number</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">body</span><span class="p">[</span><span class="n">pos</span><span class="p">:])))</span>
+            <span class="k">break</span>
+        <span class="n">end</span> <span class="o">=</span> <span class="n">pos</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">size</span>
+        <span class="k">if</span> <span class="n">end</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;truncated cell type=</span><span class="si">{</span><span class="n">cell_type</span><span class="si">}</span><span class="s2"> number=</span><span class="si">{</span><span class="n">number</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">payload</span> <span class="o">=</span> <span class="n">body</span><span class="p">[</span><span class="n">pos</span> <span class="o">+</span> <span class="mi">2</span> <span class="p">:</span> <span class="n">end</span><span class="p">]</span>
+        <span class="n">cells</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">cell_type</span><span class="p">,</span> <span class="n">number</span><span class="p">,</span> <span class="n">payload</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">cell_type</span> <span class="o">==</span> <span class="n">CELL_NAV00</span> <span class="ow">and</span> <span class="n">nav</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">nav</span> <span class="o">=</span> <span class="n">decode_nav00</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+        <span class="n">pos</span> <span class="o">=</span> <span class="n">end</span>
+    <span class="k">return</span> <span class="n">cells</span><span class="p">,</span> <span class="n">nav</span></div>
+
+
+
+<div class="viewcode-block" id="parse_realtime">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.parse_realtime">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_realtime</span><span class="p">(</span><span class="n">npl</span><span class="p">:</span> <span class="n">NPLHeader</span><span class="p">,</span> <span class="n">nph</span><span class="p">:</span> <span class="n">NPHHeader</span><span class="p">,</span> <span class="n">body</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RealtimePacket</span><span class="p">:</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">nph</span><span class="o">.</span><span class="n">service_id</span><span class="p">,</span> <span class="n">nph</span><span class="o">.</span><span class="n">pkt_type</span><span class="p">)</span> <span class="o">!=</span> <span class="p">(</span><span class="n">SERVICE_NAVDATA</span><span class="p">,</span> <span class="n">TYPE_REALTIME</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;not a realtime packet: service=</span><span class="si">{</span><span class="n">nph</span><span class="o">.</span><span class="n">service_id</span><span class="si">}</span><span class="s2"> type=</span><span class="si">{</span><span class="n">nph</span><span class="o">.</span><span class="n">pkt_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">cells</span><span class="p">,</span> <span class="n">nav</span> <span class="o">=</span> <span class="n">parse_cells</span><span class="p">(</span><span class="n">body</span><span class="p">)</span>
+    <span class="n">doors</span> <span class="o">=</span> <span class="n">doors_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">)</span>
+    <span class="n">door_open</span> <span class="o">=</span> <span class="n">door_open_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">RealtimePacket</span><span class="p">(</span><span class="n">npl</span><span class="o">=</span><span class="n">npl</span><span class="p">,</span> <span class="n">nph</span><span class="o">=</span><span class="n">nph</span><span class="p">,</span> <span class="n">nav</span><span class="o">=</span><span class="n">nav</span><span class="p">,</span> <span class="n">cells</span><span class="o">=</span><span class="n">cells</span><span class="p">,</span> <span class="n">doors</span><span class="o">=</span><span class="n">doors</span><span class="p">,</span> <span class="n">door_open</span><span class="o">=</span><span class="n">door_open</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="parse_handshake_body">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.parse_handshake_body">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_handshake_body</span><span class="p">(</span><span class="n">body</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">18</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">NDTPError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;handshake body must be 18 bytes, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">high</span><span class="p">,</span> <span class="n">low</span><span class="p">,</span> <span class="n">flags</span><span class="p">,</span> <span class="n">peer</span><span class="p">,</span> <span class="n">max_size</span><span class="p">,</span> <span class="n">_reserved</span> <span class="o">=</span> <span class="n">_HANDSHAKE_STRUCT</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="n">body</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;proto&quot;</span><span class="p">:</span> <span class="p">(</span><span class="n">high</span><span class="p">,</span> <span class="n">low</span><span class="p">),</span>
+        <span class="s2">&quot;flags&quot;</span><span class="p">:</span> <span class="n">flags</span><span class="p">,</span>
+        <span class="s2">&quot;peer_address&quot;</span><span class="p">:</span> <span class="n">peer</span><span class="p">,</span>
+        <span class="s2">&quot;max_packet_size&quot;</span><span class="p">:</span> <span class="n">max_size</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="nav_to_telemetry">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.nav_to_telemetry">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">nav_to_telemetry</span><span class="p">(</span>
+    <span class="n">peer_address</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">nav</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+    <span class="n">tr_map</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">door_open</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">cells</span><span class="p">:</span> <span class="nb">list</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Convert a decoded Nav00 into a TelemetryEvent-style row (naive UTC).&quot;&quot;&quot;</span>
+    <span class="n">tr_id</span> <span class="o">=</span> <span class="p">(</span><span class="n">tr_map</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">peer_address</span><span class="p">,</span> <span class="n">peer_address</span><span class="p">)</span>
+    <span class="n">event_time</span> <span class="o">=</span> <span class="n">datetime</span><span class="o">.</span><span class="n">fromtimestamp</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;timestamp&quot;</span><span class="p">],</span> <span class="n">tz</span><span class="o">=</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="n">tzinfo</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">door_open</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">cells</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">door_open</span> <span class="o">=</span> <span class="n">door_open_from_cells</span><span class="p">(</span><span class="n">cells</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;tr_id&quot;</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">tr_id</span><span class="p">),</span>
+        <span class="s2">&quot;unit_id&quot;</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">peer_address</span><span class="p">),</span>
+        <span class="s2">&quot;event_time&quot;</span><span class="p">:</span> <span class="n">event_time</span><span class="p">,</span>
+        <span class="s2">&quot;location_valid&quot;</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;lon&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;lon&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;lat&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;lat&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;alt&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;alt&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;speed&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;speed_avg&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;heading&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">nav</span><span class="p">[</span><span class="s2">&quot;course&quot;</span><span class="p">]),</span>
+        <span class="s2">&quot;door_open&quot;</span><span class="p">:</span> <span class="n">door_open</span><span class="p">,</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="build_handshake_frame">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.build_handshake_frame">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_handshake_frame</span><span class="p">(</span><span class="n">unit_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+    <span class="n">body</span> <span class="o">=</span> <span class="n">_HANDSHAKE_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="mi">6</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">unit_id</span><span class="p">,</span> <span class="mi">65535</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">nph</span> <span class="o">=</span> <span class="n">_NPH_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="n">SERVICE_HANDSHAKE</span><span class="p">,</span> <span class="n">TYPE_CONN_REQUEST</span><span class="p">,</span> <span class="mh">0x0001</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span>
+    <span class="n">npl</span> <span class="o">=</span> <span class="n">_NPL_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span>
+        <span class="n">SIGNATURE</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">nph</span><span class="p">)</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">),</span> <span class="mi">0</span><span class="p">,</span> <span class="n">_swap16</span><span class="p">(</span><span class="n">crc16_modbus</span><span class="p">(</span><span class="n">nph</span> <span class="o">+</span> <span class="n">body</span><span class="p">)),</span>
+        <span class="n">NPL_TYPE_NPH</span><span class="p">,</span> <span class="n">unit_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">npl</span> <span class="o">+</span> <span class="n">nph</span> <span class="o">+</span> <span class="n">body</span></div>
+
+
+
+<div class="viewcode-block" id="build_realtime_frame">
+<a class="viewcode-back" href="../../src.ndtp.html#src.ndtp.build_realtime_frame">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_realtime_frame</span><span class="p">(</span>
+    <span class="n">unit_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">timestamp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">lon</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">lat</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">valid</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">speed_avg</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">speed_max</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">course</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">altitude</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">crown_in</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">crown_out</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">crown_odometer</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="n">crown_zone</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+    <span class="n">extra</span> <span class="o">=</span> <span class="p">(</span><span class="mh">0x80</span> <span class="k">if</span> <span class="n">valid</span> <span class="k">else</span> <span class="mh">0x00</span><span class="p">)</span> <span class="o">|</span> <span class="mh">0x60</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="n">_NAV00_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span>
+        <span class="nb">int</span><span class="p">(</span><span class="n">timestamp</span><span class="p">),</span>
+        <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="nb">abs</span><span class="p">(</span><span class="n">lon</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e7</span><span class="p">)),</span>
+        <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="nb">abs</span><span class="p">(</span><span class="n">lat</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e7</span><span class="p">)),</span>
+        <span class="n">extra</span><span class="p">,</span>
+        <span class="mi">200</span><span class="p">,</span>
+        <span class="nb">int</span><span class="p">(</span><span class="n">speed_avg</span><span class="p">),</span>
+        <span class="nb">int</span><span class="p">(</span><span class="n">speed_max</span><span class="p">),</span>
+        <span class="nb">int</span><span class="p">(</span><span class="n">course</span><span class="p">),</span>
+        <span class="mi">0</span><span class="p">,</span>
+        <span class="nb">int</span><span class="p">(</span><span class="n">altitude</span><span class="p">),</span>
+        <span class="mi">8</span><span class="p">,</span>
+        <span class="mi">1</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">body</span> <span class="o">=</span> <span class="nb">bytes</span><span class="p">([</span><span class="n">CELL_NAV00</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span> <span class="o">+</span> <span class="n">payload</span>
+    <span class="c1"># Опциональная ячейка Crown03 (реальный 14-байтный layout) для тестов.</span>
+    <span class="k">if</span> <span class="n">crown_in</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">crown_out</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">counters_in</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">crown_in</span> <span class="ow">or</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+        <span class="n">counters_out</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">crown_out</span> <span class="ow">or</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+        <span class="n">body</span> <span class="o">+=</span> <span class="nb">bytes</span><span class="p">([</span><span class="n">CELL_CROWN03</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span> <span class="o">+</span> <span class="n">_CROWN03_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span>
+            <span class="o">*</span><span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFF</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="p">(</span><span class="o">*</span><span class="n">counters_in</span><span class="p">,</span> <span class="o">*</span><span class="n">counters_out</span><span class="p">)],</span>
+            <span class="nb">int</span><span class="p">(</span><span class="n">crown_odometer</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFFFFFFFF</span><span class="p">,</span>
+            <span class="nb">int</span><span class="p">(</span><span class="n">crown_zone</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFFFF</span><span class="p">,</span>
+        <span class="p">)</span>
+    <span class="n">nph</span> <span class="o">=</span> <span class="n">_NPH_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="n">SERVICE_NAVDATA</span><span class="p">,</span> <span class="n">TYPE_REALTIME</span><span class="p">,</span> <span class="mh">0x0001</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span>
+    <span class="n">npl</span> <span class="o">=</span> <span class="n">_NPL_STRUCT</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span>
+        <span class="n">SIGNATURE</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">nph</span><span class="p">)</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">body</span><span class="p">),</span> <span class="mi">0</span><span class="p">,</span> <span class="n">_swap16</span><span class="p">(</span><span class="n">crc16_modbus</span><span class="p">(</span><span class="n">nph</span> <span class="o">+</span> <span class="n">body</span><span class="p">)),</span>
+        <span class="n">NPL_TYPE_NPH</span><span class="p">,</span> <span class="n">unit_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">npl</span> <span class="o">+</span> <span class="n">nph</span> <span class="o">+</span> <span class="n">body</span></div>
+
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Предиктор задержек наземного транспорта</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Ядро</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../src.predictor.html">src.predictor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.patterns.html">src.patterns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.cascade.html">src.cascade</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.batching.html">src.batching</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.runtime.html">src.runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.ndtp.html">src.ndtp</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.ndtp_server.html">src.ndtp_server</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../../index.html">Documentation overview</a><ul>
+  <li><a href="../index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>

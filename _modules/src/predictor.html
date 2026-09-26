@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>src.predictor &#8212; Предиктор задержек наземного транспорта 1.1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="../../_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="../../_static/alabaster.css?v=27fed22d" />
+    <script src="../../_static/documentation_options.js?v=fc837d61"></script>
+    <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+   
+  <link rel="stylesheet" href="../../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for src.predictor</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot;Causal feature engineering and delay prediction for the NDTP hackathon data.</span>
+
+<span class="sd">The feature builder deliberately never reads ``time_fact_begin``.  Labels are</span>
+<span class="sd">used only as the supervised target; all telemetry-derived features are cut at</span>
+<span class="sd">the forecast timestamp ``T``.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">lru_cache</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">catboost</span><span class="w"> </span><span class="kn">import</span> <span class="n">CatBoostRegressor</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">mean_absolute_error</span>
+
+
+<span class="n">EARTH_RADIUS_KM</span> <span class="o">=</span> <span class="mf">6371.0088</span>
+<span class="n">WINDOW_SECONDS</span> <span class="o">=</span> <span class="p">(</span><span class="mi">60</span><span class="p">,</span> <span class="mi">180</span><span class="p">,</span> <span class="mi">300</span><span class="p">,</span> <span class="mi">600</span><span class="p">,</span> <span class="mi">900</span><span class="p">,</span> <span class="mi">1800</span><span class="p">)</span>
+<span class="n">SPEED_LIMITS</span> <span class="o">=</span> <span class="p">(</span><span class="mf">2.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">,</span> <span class="mf">20.0</span><span class="p">,</span> <span class="mf">40.0</span><span class="p">)</span>
+
+<span class="c1">#: Attribute key used to memoise a prepared schedule on the DataFrame itself.</span>
+<span class="c1">#: The schedule is static for the lifetime of the process, so parsing WKT,</span>
+<span class="c1">#: sorting and computing inter-stop geometry once removes ~40% of the latency</span>
+<span class="c1">#: of every single inference call.</span>
+<span class="n">_SCHEDULE_INDEX_KEY</span> <span class="o">=</span> <span class="s2">&quot;_prepared_schedule&quot;</span>
+
+
+<div class="viewcode-block" id="read_csv">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.read_csv">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_csv</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="nb">object</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Read a UTF-8 CSV while keeping mixed packet identifiers stable.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">pd</span><span class="o">.</span><span class="n">read_csv</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">low_memory</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
+
+<span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="mi">200_000</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_parse_point_wkt_cached</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+    <span class="n">match</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;POINT\s*\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\)&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">match</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+    <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)),</span> <span class="nb">float</span><span class="p">(</span><span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">))</span>
+
+
+<div class="viewcode-block" id="parse_point_wkt">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.parse_point_wkt">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_point_wkt</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="nb">object</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return ``(lon, lat)`` from the POINT WKT used by the schedule.</span>
+
+<span class="sd">    Memoised on the raw string: the schedule is parsed repeatedly (feature</span>
+<span class="sd">    building, route network, cascade graph) but every stop repeats the same</span>
+<span class="sd">    handful of coordinate strings, so a plain LRU turns a regex scan of 5.5k</span>
+<span class="sd">    rows into a dict lookup.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+    <span class="k">return</span> <span class="n">_parse_point_wkt_cached</span><span class="p">(</span><span class="n">value</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="haversine_km">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.haversine_km">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">haversine_km</span><span class="p">(</span><span class="n">lon1</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">lat1</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">lon2</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">lat2</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Vectorized great-circle distance in kilometres.&quot;&quot;&quot;</span>
+    <span class="n">lon1</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">lon1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+    <span class="n">lat1</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">lat1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+    <span class="n">phi1</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">deg2rad</span><span class="p">(</span><span class="n">lat1</span><span class="p">)</span>
+    <span class="n">lat2_arr</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">lat2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+    <span class="n">phi2</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">deg2rad</span><span class="p">(</span><span class="n">lat2_arr</span><span class="p">)</span>
+    <span class="n">dphi</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">deg2rad</span><span class="p">(</span><span class="n">lat2_arr</span> <span class="o">-</span> <span class="n">lat1</span><span class="p">)</span>
+    <span class="n">dlambda</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">deg2rad</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">lon2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span> <span class="o">-</span> <span class="n">lon1</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="n">dphi</span> <span class="o">/</span> <span class="mf">2.0</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">np</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="n">phi1</span><span class="p">)</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="n">phi2</span><span class="p">)</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="n">dlambda</span> <span class="o">/</span> <span class="mf">2.0</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span>
+    <span class="k">return</span> <span class="mf">2.0</span> <span class="o">*</span> <span class="n">EARTH_RADIUS_KM</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">arcsin</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">clip</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)))</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_safe_stats</span><span class="p">(</span><span class="n">values</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">result</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Add robust speed statistics for one telemetry window.&quot;&quot;&quot;</span>
+    <span class="n">values</span> <span class="o">=</span> <span class="n">values</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">values</span><span class="p">)]</span>
+    <span class="k">if</span> <span class="n">values</span><span class="o">.</span><span class="n">size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_mean&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_median&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_std&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_p10&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_p90&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_last&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_moving_frac&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="k">for</span> <span class="n">limit</span> <span class="ow">in</span> <span class="n">SPEED_LIMITS</span><span class="p">:</span>
+            <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_le_</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">limit</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="k">return</span>
+
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_mean&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">values</span><span class="p">))</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_median&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">median</span><span class="p">(</span><span class="n">values</span><span class="p">))</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_std&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">values</span><span class="p">))</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_p10&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">quantile</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="mf">0.10</span><span class="p">))</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_p90&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">quantile</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="mf">0.90</span><span class="p">))</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_last&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">values</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_moving_frac&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">values</span> <span class="o">&gt;</span> <span class="mf">2.0</span><span class="p">))</span>
+    <span class="k">for</span> <span class="n">limit</span> <span class="ow">in</span> <span class="n">SPEED_LIMITS</span><span class="p">:</span>
+        <span class="n">result</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">_le_</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">limit</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">values</span> <span class="o">&lt;=</span> <span class="n">limit</span><span class="p">))</span>
+
+
+<span class="n">DWELL_SPEED_KMH</span> <span class="o">=</span> <span class="mf">3.0</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_dwell_stats</span><span class="p">(</span><span class="n">speeds</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">times_ns</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Longest near-zero-speed run (seconds) and its age before the last event.</span>
+
+<span class="sd">    Causal: only the supplied prefix is scanned. Returns (dwell_s, age_to_onset_s);</span>
+<span class="sd">    both NaN when no finite samples or no dwell detected.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">speeds</span><span class="o">.</span><span class="n">size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+    <span class="n">stopped</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">speeds</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">speeds</span> <span class="o">&lt;=</span> <span class="n">DWELL_SPEED_KMH</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">stopped</span><span class="o">.</span><span class="n">any</span><span class="p">():</span>
+        <span class="k">return</span> <span class="mf">0.0</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+    <span class="c1"># Vectorized longest-true-run: boundaries where the run changes.</span>
+    <span class="n">padded</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(([</span><span class="kc">False</span><span class="p">],</span> <span class="n">stopped</span><span class="p">,</span> <span class="p">[</span><span class="kc">False</span><span class="p">]))</span>
+    <span class="n">edges</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">flatnonzero</span><span class="p">(</span><span class="n">padded</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">!=</span> <span class="n">padded</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">starts</span><span class="p">,</span> <span class="n">ends</span> <span class="o">=</span> <span class="n">edges</span><span class="p">[</span><span class="mi">0</span><span class="p">::</span><span class="mi">2</span><span class="p">],</span> <span class="n">edges</span><span class="p">[</span><span class="mi">1</span><span class="p">::</span><span class="mi">2</span><span class="p">]</span>
+    <span class="n">lengths</span> <span class="o">=</span> <span class="n">ends</span> <span class="o">-</span> <span class="n">starts</span>
+    <span class="n">best</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">lengths</span><span class="p">))</span>
+    <span class="n">onset</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="n">starts</span><span class="p">[</span><span class="n">best</span><span class="p">]])</span>
+    <span class="n">end</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="n">ends</span><span class="p">[</span><span class="n">best</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">end</span> <span class="o">-</span> <span class="n">onset</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span> <span class="o">-</span> <span class="n">onset</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_telemetry_features_for_point</span><span class="p">(</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">times_ns</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">speeds</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">lons</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">lats</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">valid_locations</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">cumulative_distance</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+    <span class="n">target_lon</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="n">target_lat</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Compute features from the causal telemetry prefix ending at ``end``.&quot;&quot;&quot;</span>
+    <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="n">end</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">out</span>
+
+    <span class="n">last_time_ns</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="n">end</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;telemetry_points&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">end</span><span class="p">)</span>
+    <span class="c1"># Age is computed by the caller (query timestamp is not the array end);</span>
+    <span class="c1"># do not derive it from the array tail here.</span>
+    <span class="n">out</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;last_event_age_s&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">window</span> <span class="ow">in</span> <span class="n">WINDOW_SECONDS</span><span class="p">:</span>
+        <span class="n">start</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">searchsorted</span><span class="p">(</span><span class="n">times_ns</span><span class="p">,</span> <span class="n">last_time_ns</span> <span class="o">-</span> <span class="n">window</span> <span class="o">*</span> <span class="mi">1_000_000_000</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="s2">&quot;left&quot;</span><span class="p">))</span>
+        <span class="n">idx</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
+        <span class="n">sp</span> <span class="o">=</span> <span class="n">speeds</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
+        <span class="n">lo</span> <span class="o">=</span> <span class="n">lons</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
+        <span class="n">la</span> <span class="o">=</span> <span class="n">lats</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
+        <span class="n">valid</span> <span class="o">=</span> <span class="n">valid_locations</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="o">&amp;</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lo</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">la</span><span class="p">)</span>
+        <span class="n">_safe_stats</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;speed_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
+        <span class="n">dwell_s</span><span class="p">,</span> <span class="n">dwell_age_s</span> <span class="o">=</span> <span class="n">_dwell_stats</span><span class="p">(</span><span class="n">sp</span><span class="p">,</span> <span class="n">times_ns</span><span class="p">[</span><span class="n">idx</span><span class="p">])</span>
+        <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;dwell_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">dwell_s</span>
+        <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;dwell_start_age_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">dwell_age_s</span>
+        <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;dwell_frac_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">dwell_s</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="n">window</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">np</span><span class="o">.</span><span class="n">any</span><span class="p">(</span><span class="n">valid</span><span class="p">):</span>
+            <span class="n">valid_lon</span> <span class="o">=</span> <span class="n">lo</span><span class="p">[</span><span class="n">valid</span><span class="p">]</span>
+            <span class="n">valid_lat</span> <span class="o">=</span> <span class="n">la</span><span class="p">[</span><span class="n">valid</span><span class="p">]</span>
+            <span class="c1"># Displacement and path length over the window.  Invalid GPS gaps</span>
+            <span class="c1"># are intentionally not interpolated.</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;gps_valid_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">valid</span><span class="p">))</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;displacement_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+                <span class="n">haversine_km</span><span class="p">(</span><span class="n">valid_lon</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:],</span> <span class="n">valid_lat</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:],</span> <span class="n">valid_lon</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">valid_lat</span><span class="p">[</span><span class="mi">0</span><span class="p">])[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="n">seg</span> <span class="o">=</span> <span class="n">haversine_km</span><span class="p">(</span><span class="n">valid_lon</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">valid_lat</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">valid_lon</span><span class="p">[</span><span class="mi">1</span><span class="p">:],</span> <span class="n">valid_lat</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+                <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;path_distance_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">nansum</span><span class="p">(</span><span class="n">seg</span><span class="p">))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;path_distance_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;gps_valid_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;displacement_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;path_distance_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+
+        <span class="c1"># Cumulative path distance is precomputed from the valid GPS stream.</span>
+        <span class="k">if</span> <span class="n">end</span> <span class="o">&gt;</span> <span class="n">start</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;path_distance_cumulative_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+                <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">end</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">start</span><span class="p">]</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;path_distance_cumulative_</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>
+
+    <span class="c1"># Latest valid location and its distance to the target.</span>
+    <span class="n">valid_idx</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">flatnonzero</span><span class="p">(</span><span class="n">valid_locations</span><span class="p">[:</span><span class="n">end</span><span class="p">]</span> <span class="o">&amp;</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lons</span><span class="p">[:</span><span class="n">end</span><span class="p">])</span> <span class="o">&amp;</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lats</span><span class="p">[:</span><span class="n">end</span><span class="p">]))</span>
+    <span class="k">if</span> <span class="n">valid_idx</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
+        <span class="n">j</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">valid_idx</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_lon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">lons</span><span class="p">[</span><span class="n">j</span><span class="p">])</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_lat&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">lats</span><span class="p">[</span><span class="n">j</span><span class="p">])</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_distance_km&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">haversine_km</span><span class="p">(</span><span class="n">lons</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">lats</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">target_lon</span><span class="p">,</span> <span class="n">target_lat</span><span class="p">))</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_distance_per_speed&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_distance_km&quot;</span><span class="p">]</span> <span class="o">/</span> <span class="nb">max</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">speeds</span><span class="p">[</span><span class="n">j</span><span class="p">]),</span> <span class="mf">2.0</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">speeds</span><span class="p">[</span><span class="n">j</span><span class="p">])</span>
+            <span class="k">else</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="p">)</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_age_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">last_time_ns</span> <span class="o">-</span> <span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="n">j</span><span class="p">]))</span> <span class="o">/</span> <span class="mf">1e9</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_lon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_lat&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_distance_km&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_distance_per_speed&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="n">out</span><span class="p">[</span><span class="s2">&quot;last_valid_age_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+    <span class="k">return</span> <span class="n">out</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_vehicle_telemetry_features</span><span class="p">(</span>
+    <span class="n">traffic</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">points</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">schedule_by_vehicle</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Build one row of causal telemetry features for every forecast point.</span>
+
+<span class="sd">    The traffic frame arrives already normalised by</span>
+<span class="sd">    :func:`src.runtime._normalise_telemetry`, so this function skips the</span>
+<span class="sd">    ``to_datetime``/``to_numeric`` coercions it used to redo on every call.</span>
+<span class="sd">    They are kept as dtype-guarded fallbacks so the function still accepts a raw</span>
+<span class="sd">    frame when called directly (tests, offline scripts).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">traffic</span> <span class="o">=</span> <span class="n">traffic</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">pd</span><span class="o">.</span><span class="n">api</span><span class="o">.</span><span class="n">types</span><span class="o">.</span><span class="n">is_datetime64_any_dtype</span><span class="p">(</span><span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;event_time&quot;</span><span class="p">]):</span>
+        <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;event_time&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_datetime</span><span class="p">(</span><span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;event_time&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">column</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;speed&quot;</span><span class="p">,</span> <span class="s2">&quot;lon&quot;</span><span class="p">,</span> <span class="s2">&quot;lat&quot;</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">pd</span><span class="o">.</span><span class="n">api</span><span class="o">.</span><span class="n">types</span><span class="o">.</span><span class="n">is_numeric_dtype</span><span class="p">(</span><span class="n">traffic</span><span class="p">[</span><span class="n">column</span><span class="p">]):</span>
+            <span class="n">traffic</span><span class="p">[</span><span class="n">column</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">traffic</span><span class="p">[</span><span class="n">column</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="nb">object</span><span class="p">:</span>
+        <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">str</span><span class="p">)</span><span class="o">.</span><span class="n">str</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">isin</span><span class="p">({</span><span class="s2">&quot;true&quot;</span><span class="p">,</span> <span class="s2">&quot;1&quot;</span><span class="p">,</span> <span class="s2">&quot;yes&quot;</span><span class="p">})</span>
+        <span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">traffic</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">fillna</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">bool</span><span class="p">)</span>
+
+    <span class="n">records</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">grouped</span> <span class="o">=</span> <span class="p">{</span><span class="nb">int</span><span class="p">(</span><span class="n">k</span><span class="p">):</span> <span class="n">g</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">g</span> <span class="ow">in</span> <span class="n">traffic</span><span class="o">.</span><span class="n">groupby</span><span class="p">(</span><span class="s2">&quot;tr_id&quot;</span><span class="p">,</span> <span class="n">sort</span><span class="o">=</span><span class="kc">False</span><span class="p">)}</span>
+    <span class="k">for</span> <span class="n">point_no</span><span class="p">,</span> <span class="p">(</span><span class="n">_</span><span class="p">,</span> <span class="n">point</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">points</span><span class="o">.</span><span class="n">iterrows</span><span class="p">(),</span> <span class="n">start</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="n">tid</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">point</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">])</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">Timestamp</span><span class="p">(</span><span class="n">point</span><span class="p">[</span><span class="s2">&quot;T&quot;</span><span class="p">])</span>
+        <span class="n">schedule</span> <span class="o">=</span> <span class="n">schedule_by_vehicle</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">tid</span><span class="p">)</span>
+        <span class="n">target_lon</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">point</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_lon&quot;</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">))</span>
+        <span class="n">target_lat</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">point</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_lat&quot;</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">schedule</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">target_lon</span><span class="p">)</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">target_lat</span><span class="p">):</span>
+            <span class="c1"># Target coordinates are normally already present in the point</span>
+            <span class="c1"># frame; this branch only supplies a fallback for malformed rows.</span>
+            <span class="n">target_lon</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">point</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_lon&quot;</span><span class="p">,</span> <span class="n">target_lon</span><span class="p">))</span>
+            <span class="n">target_lat</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">point</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_lat&quot;</span><span class="p">,</span> <span class="n">target_lat</span><span class="p">))</span>
+
+        <span class="n">g</span> <span class="o">=</span> <span class="n">grouped</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">tid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">g</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">g</span><span class="o">.</span><span class="n">empty</span><span class="p">:</span>
+            <span class="n">records</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;row_no&quot;</span><span class="p">:</span> <span class="n">point_no</span><span class="p">,</span> <span class="s2">&quot;tr_id&quot;</span><span class="p">:</span> <span class="n">tid</span><span class="p">,</span> <span class="s2">&quot;telemetry_missing&quot;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">})</span>
+            <span class="k">continue</span>
+
+        <span class="n">g</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">sort_values</span><span class="p">(</span><span class="s2">&quot;event_time&quot;</span><span class="p">,</span> <span class="n">kind</span><span class="o">=</span><span class="s2">&quot;stable&quot;</span><span class="p">)</span>
+        <span class="n">times_ns</span> <span class="o">=</span> <span class="n">g</span><span class="p">[</span><span class="s2">&quot;event_time&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;datetime64[ns]&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="s2">&quot;int64&quot;</span><span class="p">)</span>
+        <span class="n">speeds</span> <span class="o">=</span> <span class="n">g</span><span class="p">[</span><span class="s2">&quot;speed&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">lons</span> <span class="o">=</span> <span class="n">g</span><span class="p">[</span><span class="s2">&quot;lon&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">lats</span> <span class="o">=</span> <span class="n">g</span><span class="p">[</span><span class="s2">&quot;lat&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">valid_locations</span> <span class="o">=</span> <span class="n">g</span><span class="p">[</span><span class="s2">&quot;location_valid&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">bool</span><span class="p">)</span>
+
+        <span class="c1"># GPS path length, with invalid coordinates treated as gaps.</span>
+        <span class="n">cumulative_distance</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">g</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">g</span><span class="p">)):</span>
+            <span class="k">if</span> <span class="n">valid_locations</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="ow">and</span> <span class="n">valid_locations</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lons</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lons</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lats</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="ow">and</span> <span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lats</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]):</span>
+                <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="nb">float</span><span class="p">(</span><span class="n">haversine_km</span><span class="p">(</span><span class="n">lons</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">lats</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">lons</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">lats</span><span class="p">[</span><span class="n">i</span><span class="p">]))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">cumulative_distance</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span>
+
+        <span class="n">t_ns</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">Timestamp</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="o">.</span><span class="n">value</span>
+        <span class="n">end</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">searchsorted</span><span class="p">(</span><span class="n">times_ns</span><span class="p">,</span> <span class="n">t_ns</span><span class="p">,</span> <span class="n">side</span><span class="o">=</span><span class="s2">&quot;right&quot;</span><span class="p">))</span>
+        <span class="n">row</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;row_no&quot;</span><span class="p">:</span> <span class="n">point_no</span><span class="p">,</span> <span class="s2">&quot;tr_id&quot;</span><span class="p">:</span> <span class="n">tid</span><span class="p">,</span> <span class="s2">&quot;telemetry_missing&quot;</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">}</span>
+        <span class="k">if</span> <span class="n">end</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">row</span><span class="p">[</span><span class="s2">&quot;last_event_age_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">row</span><span class="p">[</span><span class="s2">&quot;last_event_age_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">((</span><span class="n">t_ns</span> <span class="o">-</span> <span class="nb">int</span><span class="p">(</span><span class="n">times_ns</span><span class="p">[</span><span class="n">end</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]))</span> <span class="o">/</span> <span class="mf">1e9</span><span class="p">)</span>
+        <span class="n">row</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+            <span class="n">_telemetry_features_for_point</span><span class="p">(</span>
+                <span class="n">end</span><span class="o">=</span><span class="n">end</span><span class="p">,</span>
+                <span class="n">times_ns</span><span class="o">=</span><span class="n">times_ns</span><span class="p">,</span>
+                <span class="n">speeds</span><span class="o">=</span><span class="n">speeds</span><span class="p">,</span>
+                <span class="n">lons</span><span class="o">=</span><span class="n">lons</span><span class="p">,</span>
+                <span class="n">lats</span><span class="o">=</span><span class="n">lats</span><span class="p">,</span>
+                <span class="n">valid_locations</span><span class="o">=</span><span class="n">valid_locations</span><span class="p">,</span>
+                <span class="n">cumulative_distance</span><span class="o">=</span><span class="n">cumulative_distance</span><span class="p">,</span>
+                <span class="n">target_lon</span><span class="o">=</span><span class="n">target_lon</span><span class="p">,</span>
+                <span class="n">target_lat</span><span class="o">=</span><span class="n">target_lat</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="p">)</span>
+        <span class="n">records</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">row</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">point_no</span> <span class="o">%</span> <span class="mi">500</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;telemetry features: </span><span class="si">{</span><span class="n">point_no</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">points</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="o">.</span><span class="n">from_records</span><span class="p">(</span><span class="n">records</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="ScheduleIndex">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.ScheduleIndex">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ScheduleIndex</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Pre-computed, purely static view of the planned timetable.</span>
+
+<span class="sd">    The schedule never changes during inference, yet</span>
+<span class="sd">    :func:`add_schedule_features` used to re-derive it on *every* call: parse</span>
+<span class="sd">    5 558 WKT points, sort by ``(tr_id, time_begin, stop_id)``, compute</span>
+<span class="sd">    ``cumcount``/inter-stop gaps and run a haversine per leg.  That was ~40% of</span>
+<span class="sd">    the total request latency for zero information gain.</span>
+
+<span class="sd">    Everything here is a function of the plan alone -- the actual-arrival column</span>
+<span class="sd">    is not even present in this subset -- so hoisting it out of the request path</span>
+<span class="sd">    cannot introduce leakage.  The heavy work happens once per process; per-request</span>
+<span class="sd">    the object only serves a merge.</span>
+
+<span class="sd">    Attributes</span>
+<span class="sd">    ----------</span>
+<span class="sd">    prepared : pandas.DataFrame</span>
+<span class="sd">        Sorted schedule with ``stop_lon``/``stop_lat`` plus the static</span>
+<span class="sd">        ``stop_idx``, ``route_stop_count``, ``planned_gap_prev_s``,</span>
+<span class="sd">        ``planned_gap_next_s`` and ``leg_distance_km`` columns.</span>
+<span class="sd">    by_vehicle : dict</span>
+<span class="sd">        ``tr_id -&gt; DataFrame`` slice, reused by the simulator snapshot builder so</span>
+<span class="sd">        it stops copying the whole schedule per forecast point.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">&quot;prepared&quot;</span><span class="p">,</span> <span class="s2">&quot;by_vehicle&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">schedule</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">frame</span> <span class="o">=</span> <span class="n">schedule</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+        <span class="n">frame</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">dropna</span><span class="p">(</span><span class="n">subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">])</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="s2">&quot;int64&quot;</span><span class="p">)</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+        <span class="n">frame</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">dropna</span><span class="p">(</span><span class="n">subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">])</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="s2">&quot;int64&quot;</span><span class="p">)</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_datetime</span><span class="p">(</span><span class="n">frame</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+        <span class="n">frame</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">dropna</span><span class="p">(</span><span class="n">subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">])</span>
+
+        <span class="k">if</span> <span class="s2">&quot;geom&quot;</span> <span class="ow">in</span> <span class="n">frame</span><span class="o">.</span><span class="n">columns</span><span class="p">:</span>
+            <span class="n">parsed</span> <span class="o">=</span> <span class="p">[</span><span class="n">parse_point_wkt</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;geom&quot;</span><span class="p">]]</span>
+            <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">parsed</span><span class="p">]</span>
+            <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lat&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">parsed</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+            <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lat&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span>
+
+        <span class="n">frame</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">sort_values</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">,</span> <span class="s2">&quot;time_begin&quot;</span><span class="p">,</span> <span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">],</span> <span class="n">kind</span><span class="o">=</span><span class="s2">&quot;stable&quot;</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">reset_index</span><span class="p">(</span><span class="n">drop</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+        <span class="n">grouped</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">groupby</span><span class="p">(</span><span class="s2">&quot;tr_id&quot;</span><span class="p">,</span> <span class="n">sort</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_idx&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">grouped</span><span class="o">.</span><span class="n">cumcount</span><span class="p">()</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;route_stop_count&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">grouped</span><span class="p">[</span><span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">transform</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">)</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;planned_gap_prev_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">grouped</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">diff</span><span class="p">()</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">total_seconds</span><span class="p">()</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;planned_gap_next_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">grouped</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">total_seconds</span><span class="p">()</span>
+
+        <span class="n">lons</span> <span class="o">=</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lon&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">lats</span> <span class="o">=</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;stop_lat&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">legs</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">frame</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+        <span class="n">tr_ids</span> <span class="o">=</span> <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">tid</span> <span class="ow">in</span> <span class="n">np</span><span class="o">.</span><span class="n">unique</span><span class="p">(</span><span class="n">tr_ids</span><span class="p">):</span>
+            <span class="n">mask</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">flatnonzero</span><span class="p">(</span><span class="n">tr_ids</span> <span class="o">==</span> <span class="n">tid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="n">steps</span> <span class="o">=</span> <span class="n">haversine_km</span><span class="p">(</span>
+                    <span class="n">lons</span><span class="p">[</span><span class="n">mask</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]],</span>
+                    <span class="n">lats</span><span class="p">[</span><span class="n">mask</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]],</span>
+                    <span class="n">lons</span><span class="p">[</span><span class="n">mask</span><span class="p">[</span><span class="mi">1</span><span class="p">:]],</span>
+                    <span class="n">lats</span><span class="p">[</span><span class="n">mask</span><span class="p">[</span><span class="mi">1</span><span class="p">:]],</span>
+                <span class="p">)</span>
+                <span class="n">legs</span><span class="p">[</span><span class="n">mask</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]]</span> <span class="o">=</span> <span class="n">steps</span>
+        <span class="n">frame</span><span class="p">[</span><span class="s2">&quot;leg_distance_km&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">legs</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">prepared</span> <span class="o">=</span> <span class="n">frame</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">by_vehicle</span> <span class="o">=</span> <span class="p">{</span><span class="nb">int</span><span class="p">(</span><span class="n">tid</span><span class="p">):</span> <span class="n">group</span> <span class="k">for</span> <span class="n">tid</span><span class="p">,</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">frame</span><span class="o">.</span><span class="n">groupby</span><span class="p">(</span><span class="s2">&quot;tr_id&quot;</span><span class="p">,</span> <span class="n">sort</span><span class="o">=</span><span class="kc">False</span><span class="p">)}</span></div>
+
+
+
+<div class="viewcode-block" id="schedule_index">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.schedule_index">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">schedule_index</span><span class="p">(</span><span class="n">schedule</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span> <span class="o">|</span> <span class="n">ScheduleIndex</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ScheduleIndex</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return a :class:`ScheduleIndex` for ``schedule``, building it once.</span>
+
+<span class="sd">    The index is memoised on the DataFrame through ``DataFrame.attrs`` so the</span>
+<span class="sd">    caller does not have to thread it through every call site, and its lifetime</span>
+<span class="sd">    is exactly the lifetime of the frame.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">schedule</span><span class="p">,</span> <span class="n">ScheduleIndex</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">schedule</span>
+    <span class="n">cached</span> <span class="o">=</span> <span class="n">schedule</span><span class="o">.</span><span class="n">attrs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">_SCHEDULE_INDEX_KEY</span><span class="p">)</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">schedule</span><span class="p">,</span> <span class="s2">&quot;attrs&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cached</span><span class="p">,</span> <span class="n">ScheduleIndex</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">cached</span>
+    <span class="n">built</span> <span class="o">=</span> <span class="n">ScheduleIndex</span><span class="p">(</span><span class="n">schedule</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">schedule</span><span class="p">,</span> <span class="s2">&quot;attrs&quot;</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">schedule</span><span class="o">.</span><span class="n">attrs</span><span class="p">[</span><span class="n">_SCHEDULE_INDEX_KEY</span><span class="p">]</span> <span class="o">=</span> <span class="n">built</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">AttributeError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>  <span class="c1"># pragma: no cover - defensive</span>
+            <span class="k">pass</span>
+    <span class="k">return</span> <span class="n">built</span></div>
+
+
+
+<div class="viewcode-block" id="add_schedule_features">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.add_schedule_features">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">add_schedule_features</span><span class="p">(</span>
+    <span class="n">points</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">schedule_path</span><span class="p">:</span> <span class="n">Path</span> <span class="o">|</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Attach static planned-route features without reading actual times.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">add_schedule_features_with_index</span><span class="p">(</span><span class="n">points</span><span class="p">,</span> <span class="n">schedule_index</span><span class="p">(</span><span class="n">schedule_path</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="add_schedule_features_with_index">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.add_schedule_features_with_index">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">add_schedule_features_with_index</span><span class="p">(</span>
+    <span class="n">points</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">index</span><span class="p">:</span> <span class="n">ScheduleIndex</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Attach static planned-route features using a pre-computed schedule.</span>
+
+<span class="sd">    Identical output to :func:`add_schedule_features` (that function is now a</span>
+<span class="sd">    thin wrapper around this one) but skips all schedule preparation.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">schedule</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">prepared</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">points</span><span class="o">.</span><span class="n">merge</span><span class="p">(</span>
+        <span class="n">schedule</span><span class="p">[</span>
+            <span class="p">[</span>
+                <span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;tr_id&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;time_begin&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_lon&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_lat&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_idx&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;route_stop_count&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;planned_gap_prev_s&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;planned_gap_next_s&quot;</span><span class="p">,</span>
+            <span class="p">]</span>
+        <span class="p">]</span><span class="o">.</span><span class="n">rename</span><span class="p">(</span>
+            <span class="n">columns</span><span class="o">=</span><span class="p">{</span>
+                <span class="s2">&quot;tt_action_item_id&quot;</span><span class="p">:</span> <span class="s2">&quot;target_stop_id&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;time_begin&quot;</span><span class="p">:</span> <span class="s2">&quot;schedule_target_time&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_lon&quot;</span><span class="p">:</span> <span class="s2">&quot;target_lon&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_lat&quot;</span><span class="p">:</span> <span class="s2">&quot;target_lat&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;stop_idx&quot;</span><span class="p">:</span> <span class="s2">&quot;target_stop_idx&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;route_stop_count&quot;</span><span class="p">:</span> <span class="s2">&quot;target_route_stop_count&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;planned_gap_prev_s&quot;</span><span class="p">:</span> <span class="s2">&quot;target_prev_gap_s&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;planned_gap_next_s&quot;</span><span class="p">:</span> <span class="s2">&quot;target_next_gap_s&quot;</span><span class="p">,</span>
+            <span class="p">}</span>
+        <span class="p">),</span>
+        <span class="n">on</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;target_stop_id&quot;</span><span class="p">,</span> <span class="s2">&quot;tr_id&quot;</span><span class="p">],</span>
+        <span class="n">how</span><span class="o">=</span><span class="s2">&quot;left&quot;</span><span class="p">,</span>
+        <span class="n">validate</span><span class="o">=</span><span class="s2">&quot;many_to_one&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_datetime</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;T&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_time_dt&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_datetime</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_time_begin&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;lead_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_time_dt&quot;</span><span class="p">]</span> <span class="o">-</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">])</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">total_seconds</span><span class="p">()</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_hour&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_time_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">hour</span> <span class="o">+</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_time_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">minute</span> <span class="o">/</span> <span class="mf">60.0</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_hour&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">hour</span> <span class="o">+</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">minute</span> <span class="o">/</span> <span class="mf">60.0</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_minute&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">minute</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dayofweek&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">dt</span><span class="o">.</span><span class="n">dayofweek</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;is_weekend&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_dayofweek&quot;</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">int</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;hour_sin&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="mf">2.0</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">pi</span> <span class="o">*</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_hour&quot;</span><span class="p">]</span> <span class="o">/</span> <span class="mf">24.0</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;hour_cos&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="mf">2.0</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">pi</span> <span class="o">*</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;T_hour&quot;</span><span class="p">]</span> <span class="o">/</span> <span class="mf">24.0</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_abs&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_dev_s&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_sq&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_dev_s&quot;</span><span class="p">]</span> <span class="o">**</span> <span class="mi">2</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_sign&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sign</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_dev_s&quot;</span><span class="p">])</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_positive&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">&quot;cur_dev_s&quot;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">int</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;lead_minus_660&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;lead_s&quot;</span><span class="p">]</span> <span class="o">-</span> <span class="mf">660.0</span>
+
+    <span class="n">schedule_by_vehicle</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">by_vehicle</span>
+    <span class="n">between</span><span class="p">,</span> <span class="n">gap_mean</span><span class="p">,</span> <span class="n">gap_std</span><span class="p">,</span> <span class="n">gap_min</span><span class="p">,</span> <span class="n">gap_max</span> <span class="o">=</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">out</span><span class="o">.</span><span class="n">iterrows</span><span class="p">():</span>
+        <span class="n">g</span> <span class="o">=</span> <span class="n">schedule_by_vehicle</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">row</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]))</span>
+        <span class="k">if</span> <span class="n">g</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">between</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+            <span class="n">gap_mean</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+            <span class="n">gap_std</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+            <span class="n">gap_min</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+            <span class="n">gap_max</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+            <span class="k">continue</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;T_dt&quot;</span><span class="p">]</span>
+        <span class="n">target_t</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;target_time_dt&quot;</span><span class="p">]</span>
+        <span class="n">q</span> <span class="o">=</span> <span class="n">g</span><span class="p">[(</span><span class="n">g</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">t</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">g</span><span class="p">[</span><span class="s2">&quot;time_begin&quot;</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="n">target_t</span><span class="p">)]</span>
+        <span class="n">between</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">q</span><span class="p">)))</span>
+        <span class="n">gaps</span> <span class="o">=</span> <span class="n">q</span><span class="p">[</span><span class="s2">&quot;planned_gap_prev_s&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to_numpy</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="nb">float</span><span class="p">)</span>
+        <span class="n">gaps</span> <span class="o">=</span> <span class="n">gaps</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">gaps</span><span class="p">)]</span>
+        <span class="n">gap_mean</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">gaps</span><span class="p">))</span> <span class="k">if</span> <span class="n">gaps</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+        <span class="n">gap_std</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">gaps</span><span class="p">))</span> <span class="k">if</span> <span class="n">gaps</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+        <span class="n">gap_min</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">min</span><span class="p">(</span><span class="n">gaps</span><span class="p">))</span> <span class="k">if</span> <span class="n">gaps</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+        <span class="n">gap_max</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">gaps</span><span class="p">))</span> <span class="k">if</span> <span class="n">gaps</span><span class="o">.</span><span class="n">size</span> <span class="k">else</span> <span class="n">math</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;planned_stops_between&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">between</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;between_gap_mean_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">gap_mean</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;between_gap_std_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">gap_std</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;between_gap_min_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">gap_min</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;between_gap_max_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">gap_max</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_stop_fraction&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_stop_idx&quot;</span><span class="p">]</span> <span class="o">/</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_route_stop_count&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">nan</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_prev_gap_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_prev_gap_s&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">fillna</span><span class="p">(</span><span class="o">-</span><span class="mf">1.0</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_next_gap_s&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;target_next_gap_s&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">fillna</span><span class="p">(</span><span class="o">-</span><span class="mf">1.0</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">out</span><span class="p">,</span> <span class="n">schedule_by_vehicle</span></div>
+
+
+
+<div class="viewcode-block" id="build_features">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.build_features">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_features</span><span class="p">(</span>
+    <span class="n">points</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">traffic_path</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+    <span class="n">schedule_path</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Build static and causal telemetry features for a point set.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">build_features_from_frames</span><span class="p">(</span>
+        <span class="n">points</span><span class="p">,</span>
+        <span class="n">read_csv</span><span class="p">(</span><span class="n">traffic_path</span><span class="p">),</span>
+        <span class="n">read_csv</span><span class="p">(</span><span class="n">schedule_path</span><span class="p">),</span>
+    <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="build_features_from_frames">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.build_features_from_frames">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_features_from_frames</span><span class="p">(</span>
+    <span class="n">points</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">traffic</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">schedule</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="n">index</span><span class="p">:</span> <span class="n">ScheduleIndex</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Build static and causal telemetry features for a point set.</span>
+
+<span class="sd">    ``index`` lets a long-lived caller pass a pre-computed</span>
+<span class="sd">    :class:`ScheduleIndex`; when omitted it is memoised on the schedule frame,</span>
+<span class="sd">    so the static timetable work happens once per process either way.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">points</span> <span class="o">=</span> <span class="n">points</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+    <span class="n">points</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">points</span><span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">int</span><span class="p">)</span>
+    <span class="n">points</span><span class="p">[</span><span class="s2">&quot;row_no&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">points</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+    <span class="n">prepared</span> <span class="o">=</span> <span class="n">index</span> <span class="k">if</span> <span class="n">index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">schedule_index</span><span class="p">(</span><span class="n">schedule</span><span class="p">)</span>
+    <span class="n">static</span><span class="p">,</span> <span class="n">schedule_by_vehicle</span> <span class="o">=</span> <span class="n">add_schedule_features_with_index</span><span class="p">(</span><span class="n">points</span><span class="p">,</span> <span class="n">prepared</span><span class="p">)</span>
+    <span class="n">telemetry</span> <span class="o">=</span> <span class="n">_vehicle_telemetry_features</span><span class="p">(</span><span class="n">traffic</span><span class="p">,</span> <span class="n">static</span><span class="p">,</span> <span class="n">schedule_by_vehicle</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">static</span><span class="o">.</span><span class="n">merge</span><span class="p">(</span><span class="n">telemetry</span><span class="p">,</span> <span class="n">on</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;row_no&quot;</span><span class="p">,</span> <span class="s2">&quot;tr_id&quot;</span><span class="p">],</span> <span class="n">how</span><span class="o">=</span><span class="s2">&quot;left&quot;</span><span class="p">,</span> <span class="n">validate</span><span class="o">=</span><span class="s2">&quot;one_to_one&quot;</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="select_feature_columns">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.select_feature_columns">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">select_feature_columns</span><span class="p">(</span><span class="n">frame</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Select numeric features; identifiers are added separately as categories.&quot;&quot;&quot;</span>
+    <span class="n">excluded</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;sample_id&quot;</span><span class="p">,</span> <span class="s2">&quot;tr_id&quot;</span><span class="p">,</span> <span class="s2">&quot;T&quot;</span><span class="p">,</span> <span class="s2">&quot;target_stop_id&quot;</span><span class="p">,</span> <span class="s2">&quot;target_time_begin&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;target_delay_s&quot;</span><span class="p">,</span> <span class="s2">&quot;target_class&quot;</span><span class="p">,</span> <span class="s2">&quot;T_dt&quot;</span><span class="p">,</span> <span class="s2">&quot;target_time_dt&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;schedule_target_time&quot;</span><span class="p">,</span> <span class="s2">&quot;row_no&quot;</span><span class="p">,</span> <span class="s2">&quot;target_lon&quot;</span><span class="p">,</span> <span class="s2">&quot;target_lat&quot;</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="n">cols</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">frame</span><span class="o">.</span><span class="n">columns</span> <span class="k">if</span> <span class="n">c</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">excluded</span><span class="p">]</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">cols</span> <span class="k">if</span> <span class="n">pd</span><span class="o">.</span><span class="n">api</span><span class="o">.</span><span class="n">types</span><span class="o">.</span><span class="n">is_numeric_dtype</span><span class="p">(</span><span class="n">frame</span><span class="p">[</span><span class="n">c</span><span class="p">])]</span></div>
+
+
+
+<div class="viewcode-block" id="train_model">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.train_model">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">train_model</span><span class="p">(</span>
+    <span class="n">train_frame</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">use_vehicle_category</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">iterations</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">700</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CatBoostRegressor</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fit a robust CatBoost regressor and return it with its feature list.</span>
+
+<span class="sd">    Fixed iteration budget, no eval set: pass a pre-split frame if you need</span>
+<span class="sd">    honest holdout metrics (see callers), the model itself never sees it.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">features</span> <span class="o">=</span> <span class="n">select_feature_columns</span><span class="p">(</span><span class="n">train_frame</span><span class="p">)</span>
+    <span class="n">cat_features</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;tr_id&quot;</span><span class="p">]</span> <span class="k">if</span> <span class="n">use_vehicle_category</span> <span class="k">else</span> <span class="p">[]</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">CatBoostRegressor</span><span class="p">(</span>
+        <span class="n">iterations</span><span class="o">=</span><span class="n">iterations</span><span class="p">,</span>
+        <span class="n">depth</span><span class="o">=</span><span class="mi">7</span><span class="p">,</span>
+        <span class="n">learning_rate</span><span class="o">=</span><span class="mf">0.035</span><span class="p">,</span>
+        <span class="n">loss_function</span><span class="o">=</span><span class="s2">&quot;MAE&quot;</span><span class="p">,</span>
+        <span class="n">random_seed</span><span class="o">=</span><span class="mi">2026</span><span class="p">,</span>
+        <span class="n">l2_leaf_reg</span><span class="o">=</span><span class="mf">8.0</span><span class="p">,</span>
+        <span class="n">random_strength</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span>
+        <span class="n">verbose</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">allow_writing_files</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">thread_count</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span>
+        <span class="n">train_frame</span><span class="p">[</span><span class="n">features</span> <span class="o">+</span> <span class="n">cat_features</span><span class="p">],</span>
+        <span class="n">train_frame</span><span class="p">[</span><span class="s2">&quot;target_delay_s&quot;</span><span class="p">],</span>
+        <span class="n">cat_features</span><span class="o">=</span><span class="n">cat_features</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">model</span><span class="p">,</span> <span class="n">features</span> <span class="o">+</span> <span class="n">cat_features</span></div>
+
+
+
+<div class="viewcode-block" id="predict">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.predict">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">predict</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">CatBoostRegressor</span><span class="p">,</span> <span class="n">frame</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="n">features</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Produce predictions while tolerating missing optional columns.&quot;&quot;&quot;</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">frame</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">col</span> <span class="ow">in</span> <span class="n">features</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">col</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">x</span><span class="p">:</span>
+            <span class="n">x</span><span class="p">[</span><span class="n">col</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">nan</span>
+    <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="n">features</span><span class="p">])</span></div>
+
+
+
+<div class="viewcode-block" id="evaluate">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.evaluate">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">evaluate</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">CatBoostRegressor</span><span class="p">,</span> <span class="n">frame</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="n">features</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return MAE in seconds for a labelled frame.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="n">mean_absolute_error</span><span class="p">(</span><span class="n">frame</span><span class="p">[</span><span class="s2">&quot;target_delay_s&quot;</span><span class="p">],</span> <span class="n">predict</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">frame</span><span class="p">,</span> <span class="n">features</span><span class="p">)))</span></div>
+
+
+
+<div class="viewcode-block" id="main">
+<a class="viewcode-back" href="../../src.predictor.html#src.predictor.main">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">parents</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">/</span> <span class="s2">&quot;dataset&quot;</span>
+    <span class="n">train_labels</span> <span class="o">=</span> <span class="n">read_csv</span><span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;labels&quot;</span> <span class="o">/</span> <span class="s2">&quot;labels_train.csv&quot;</span><span class="p">)</span>
+    <span class="n">test_labels</span> <span class="o">=</span> <span class="n">read_csv</span><span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;labels&quot;</span> <span class="o">/</span> <span class="s2">&quot;labels_test.csv&quot;</span><span class="p">)</span>
+    <span class="n">validate_points</span> <span class="o">=</span> <span class="n">read_csv</span><span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;validate&quot;</span> <span class="o">/</span> <span class="s2">&quot;points.csv&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;building train features&quot;</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">train_frame</span> <span class="o">=</span> <span class="n">build_features</span><span class="p">(</span><span class="n">train_labels</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;train&quot;</span> <span class="o">/</span> <span class="s2">&quot;traffic.csv&quot;</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;train&quot;</span> <span class="o">/</span> <span class="s2">&quot;schedule.csv&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;building test features&quot;</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">test_frame</span> <span class="o">=</span> <span class="n">build_features</span><span class="p">(</span><span class="n">test_labels</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;test&quot;</span> <span class="o">/</span> <span class="s2">&quot;traffic.csv&quot;</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;test&quot;</span> <span class="o">/</span> <span class="s2">&quot;schedule.csv&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;building validate features&quot;</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">validate_frame</span> <span class="o">=</span> <span class="n">build_features</span><span class="p">(</span><span class="n">validate_points</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;validate&quot;</span> <span class="o">/</span> <span class="s2">&quot;traffic.csv&quot;</span><span class="p">,</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;validate&quot;</span> <span class="o">/</span> <span class="s2">&quot;schedule_plan.csv&quot;</span><span class="p">)</span>
+    <span class="n">model</span><span class="p">,</span> <span class="n">features</span> <span class="o">=</span> <span class="n">train_model</span><span class="p">(</span><span class="n">train_frame</span><span class="p">)</span>
+    <span class="n">pred_test</span> <span class="o">=</span> <span class="n">predict</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">test_frame</span><span class="p">,</span> <span class="n">features</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;test MAE: </span><span class="si">{</span><span class="n">mean_absolute_error</span><span class="p">(</span><span class="n">test_labels</span><span class="p">[</span><span class="s1">&#39;target_delay_s&#39;</span><span class="p">],</span><span class="w"> </span><span class="n">pred_test</span><span class="p">)</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;baseline MAE: </span><span class="si">{</span><span class="n">mean_absolute_error</span><span class="p">(</span><span class="n">test_labels</span><span class="p">[</span><span class="s1">&#39;target_delay_s&#39;</span><span class="p">],</span><span class="w"> </span><span class="n">test_labels</span><span class="p">[</span><span class="s1">&#39;cur_dev_s&#39;</span><span class="p">])</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">pred</span> <span class="o">=</span> <span class="n">predict</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">validate_frame</span><span class="p">,</span> <span class="n">features</span><span class="p">)</span>
+    <span class="n">submission</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">({</span><span class="s2">&quot;sample_id&quot;</span><span class="p">:</span> <span class="n">validate_points</span><span class="p">[</span><span class="s2">&quot;sample_id&quot;</span><span class="p">],</span> <span class="s2">&quot;prediction&quot;</span><span class="p">:</span> <span class="n">pred</span><span class="p">})</span>
+    <span class="n">submission</span><span class="o">.</span><span class="n">to_csv</span><span class="p">(</span><span class="n">root</span><span class="o">.</span><span class="n">parent</span> <span class="o">/</span> <span class="s2">&quot;submission.csv&quot;</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">sep</span><span class="o">=</span><span class="s2">&quot;;&quot;</span><span class="p">,</span> <span class="n">float_format</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">%.6f</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;wrote </span><span class="si">{</span><span class="n">root</span><span class="o">.</span><span class="n">parent</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="s1">&#39;submission.csv&#39;</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">submission</span><span class="p">)</span><span class="si">}</span><span class="s2"> rows)&quot;</span><span class="p">)</span></div>
+
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Предиктор задержек наземного транспорта</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Ядро</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../src.predictor.html">src.predictor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.patterns.html">src.patterns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.cascade.html">src.cascade</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.batching.html">src.batching</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.runtime.html">src.runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.ndtp.html">src.ndtp</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../src.ndtp_server.html">src.ndtp_server</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../../index.html">Documentation overview</a><ul>
+  <li><a href="../index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>
