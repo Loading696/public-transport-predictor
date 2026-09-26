@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -14,13 +16,19 @@ from pydantic import BaseModel, Field, ValidationError
 
 from src.runtime import InferenceService, StreamSimulator
 from src.ndtp_server import NDTPReceiver
+from src.batching import MicroBatcher
 
 DEFAULT_SPEED = float(os.getenv("SIMULATION_SPEED", "60"))
 TCP_PORT = int(os.getenv("TCP_PORT", "9201"))
 # Троттлинг live-прогнозов: пересчёт для юнита не чаще TTL, повторные опросы
 # /stream/status без новых данных отдают кэшированный прогноз.
 LIVE_PREDICT_TTL = float(os.getenv("LIVE_PREDICT_TTL", "10"))
-app = FastAPI(title="Transport Delay MVP", version="1.0.0")
+# Окно сбора микро-батча: сколько ждать соседние запросы перед общим вызовом.
+BATCH_WINDOW_MS = float(os.getenv("PREDICT_BATCH_WINDOW_MS", "4"))
+# Потолок строк в одном батче, ограничивающий пиковую память фрейма признаков.
+PREDICT_BATCH_MAX_ROWS = int(os.getenv("PREDICT_BATCH_MAX_ROWS", "256"))
+
+app = FastAPI(title="Transport Delay MVP", version="1.1.0")
 
 # Кэш прогнозов живого потока: (unit_id, event_time_iso) -> (mono_ts, forecast).
 # forecast — только прогнозная часть юнита (позиция/двери всегда свежие из строк).
@@ -46,6 +54,108 @@ _FORECAST_KEYS = (
     "p_late",
     "pattern_events",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Метрики
+# --------------------------------------------------------------------------- #
+
+
+class Metrics:
+    """Lightweight request/inference accounting, no external dependency.
+
+    Latency is kept as a count/sum/max triple plus a coarse histogram rather
+    than every sample: a bounded structure can never grow with traffic, and the
+    median is still recoverable from the buckets.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.started_at = time.time()
+        self.counts: dict[str, int] = defaultdict(int)
+        self.errors: dict[str, int] = defaultdict(int)
+        self.total_s: dict[str, float] = defaultdict(float)
+        self.max_s: dict[str, float] = defaultdict(float)
+        self.histogram: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.inference = {"calls": 0, "rows": 0, "total_s": 0.0, "max_s": 0.0}
+
+    def observe(self, name: str, seconds: float, *, error: bool = False) -> None:
+        self.counts[name] += 1
+        self.total_s[name] += seconds
+        self.max_s[name] = max(self.max_s[name], seconds)
+        self.histogram[name][_bucket(seconds)] += 1
+        if error:
+            self.errors[name] += 1
+
+    def observe_inference(self, seconds: float, rows: int) -> None:
+        self.inference["calls"] += 1
+        self.inference["rows"] += rows
+        self.inference["total_s"] += seconds
+        self.inference["max_s"] = max(self.inference["max_s"], seconds)
+
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            endpoints = {}
+            for name, count in self.counts.items():
+                endpoints[name] = {
+                    "calls": count,
+                    "errors": self.errors.get(name, 0),
+                    "mean_s": round(self.total_s[name] / count, 4) if count else 0.0,
+                    "max_s": round(self.max_s[name], 4),
+                    "histogram": dict(sorted(self.histogram[name].items())),
+                }
+            inference = dict(self.inference)
+            inference["mean_s"] = (
+                round(inference["total_s"] / inference["calls"], 4) if inference["calls"] else 0.0
+            )
+            inference["mean_rows"] = (
+                round(inference["rows"] / inference["calls"], 2) if inference["calls"] else 0.0
+            )
+            inference["rows_per_s"] = (
+                round(inference["rows"] / inference["total_s"], 1) if inference["total_s"] else 0.0
+            )
+            return {
+                "uptime_s": round(time.time() - self.started_at, 1),
+                "endpoints": endpoints,
+                "inference": inference,
+            }
+
+
+METRICS = Metrics()
+
+_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+
+
+def _bucket(seconds: float) -> str:
+    for edge in _BUCKETS:
+        if seconds < edge:
+            return f"<{round(edge * 1000)}ms"
+    return ">=5000ms"
+
+
+@app.middleware("http")
+async def timing_middleware(request: Request, call_next):
+    """Time every request, tag the response, and count failures.
+
+    Executed on the event loop but does no I/O of its own, so it costs
+    microseconds.  Inference time is recorded separately by the service, which
+    knows how much of the request was the model.
+    """
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        METRICS.observe(request.url.path, time.perf_counter() - started, error=True)
+        raise
+    elapsed = time.perf_counter() - started
+    METRICS.observe(request.url.path, elapsed, error=response.status_code >= 400)
+    response.headers["X-Response-Time-Ms"] = f"{elapsed * 1000:.1f}"
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Схемы запросов
+# --------------------------------------------------------------------------- #
 
 
 class TelemetryEvent(BaseModel):
@@ -91,12 +201,31 @@ def _dump(value: Any) -> Any:
     return value
 
 
+# --------------------------------------------------------------------------- #
+# Зависимости
+# --------------------------------------------------------------------------- #
+
+
 def _get_runtime() -> InferenceService:
     runtime = getattr(app.state, "runtime", None)
     if runtime is None:
         runtime = InferenceService()
         app.state.runtime = runtime
     return runtime
+
+
+async def _get_batcher() -> MicroBatcher:
+    batcher = getattr(app.state, "batcher", None)
+    if batcher is None:
+        batcher = MicroBatcher(
+            _get_runtime(),
+            max_batch_rows=PREDICT_BATCH_MAX_ROWS,
+            window_ms=BATCH_WINDOW_MS,
+        )
+        app.state.batcher = batcher
+    if batcher._task is None or batcher._task.done():
+        await batcher.start()
+    return batcher
 
 
 async def _get_simulator() -> StreamSimulator:
@@ -133,6 +262,7 @@ KNOWN_ROUTES = [
     "/v1/models",
     "/ndtp/status",
     "/cascade",
+    "/metrics",
 ]
 
 
@@ -140,30 +270,9 @@ def _get_ndtp() -> NDTPReceiver | None:
     return getattr(app.state, "ndtp", None)
 
 
-def _unit_tr_map() -> dict[int, int]:
-    raw = os.getenv("UNIT_TR_MAP", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return {}
-    mapping: dict[int, int] = {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            try:
-                mapping[int(key)] = int(value)
-            except (TypeError, ValueError):
-                continue
-    return mapping
-
-
-# Горизонт цели, на котором училась модель: плановая остановка строго
-# в окне (T+600, T+900] (см. lead_minus_660 = lead_s - 660 в фичах).
-# Цель ближе/дальше — out-of-distribution: lead_s улетает, прогноз мусорный,
-# поэтому вне окна прогноз не выдаём (prediction=None + пометка).
-LIVE_TARGET_MIN_S = 600
-LIVE_TARGET_MAX_S = 900
+# --------------------------------------------------------------------------- #
+# Live-агрегация
+# --------------------------------------------------------------------------- #
 
 
 async def _live_units() -> list[dict[str, Any]]:
@@ -189,6 +298,7 @@ async def _live_units() -> list[dict[str, Any]]:
     receiver = _get_ndtp()
     if receiver is None:
         return []
+    runtime = _get_runtime()
     mapping = _unit_tr_map()
     try:
         receiver.set_tr_map(mapping)
@@ -230,26 +340,14 @@ async def _live_units() -> list[dict[str, Any]]:
                 "source": "live",
             }
         )
-    # Прогнозы для живого потока (best-effort: без расписания/модели — без прогноза).
     try:
-        runtime = _get_runtime()
+        batcher = await _get_batcher()
     except Exception:
+        batcher = None
+    if batcher is None:
         for unit in units:
             unit.pop("_event_time", None)
-            unit.update(
-                {
-                    "target_stop_id": None,
-                    "target_time_begin": None,
-                    "target_status": "no_model",
-                    "target_note": "прогноз недоступен: нет модели/расписания",
-                    "cur_dev_hint": None,
-                    "prediction": None,
-                    "risk": None,
-                    "target_class": None,
-                    "recommendation": None,
-                    "forecast_cached": False,
-                }
-            )
+            unit.update(_no_model_forecast())
         return units
     try:
         points: list[dict[str, Any]] = []
@@ -269,9 +367,7 @@ async def _live_units() -> list[dict[str, Any]]:
                     unit["forecast_cached"] = True
                     cached_idx.add(idx)
                     continue
-            target_id, target_time, target_status = _live_target(
-                runtime, unit["tr_id"], event_time
-            )
+            target_id, target_time, target_status = runtime.live_target(unit["tr_id"], event_time)
             unit["target_stop_id"] = target_id
             unit["target_time_begin"] = target_time.isoformat() if hasattr(target_time, "isoformat") else target_time
             unit["_target_time"] = target_time
@@ -320,7 +416,9 @@ async def _live_units() -> list[dict[str, Any]]:
         # горизонта точек не строят и чужой прогноз получать не должны.
         predicted: dict[int, dict[str, Any]] = {}
         if points:
-            result = await asyncio.to_thread(runtime.predict_records, points, telemetry or None)
+            started = time.perf_counter()
+            result = await batcher.predict_records(points, telemetry or None)
+            METRICS.observe_inference(time.perf_counter() - started, len(points))
             for pos, record in zip(point_unit_idx, result):
                 predicted[pos] = record
         for idx, unit in enumerate(units):
@@ -380,6 +478,39 @@ async def _live_units() -> list[dict[str, Any]]:
     return units
 
 
+def _no_model_forecast() -> dict[str, Any]:
+    return {
+        "target_stop_id": None,
+        "target_time_begin": None,
+        "target_status": "no_model",
+        "target_note": "прогноз недоступен: нет модели/расписания",
+        "cur_dev_hint": None,
+        "prediction": None,
+        "risk": None,
+        "target_class": None,
+        "recommendation": None,
+        "forecast_cached": False,
+    }
+
+
+def _unit_tr_map() -> dict[int, int]:
+    raw = os.getenv("UNIT_TR_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    mapping: dict[int, int] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            try:
+                mapping[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return mapping
+
+
 def _target_note(status: str) -> str | None:
     """Человекочитаемая пометка статуса цели для витрины."""
     return {
@@ -391,48 +522,9 @@ def _target_note(status: str) -> str | None:
     }.get(status, "прогноз недоступен")
 
 
-def _live_target(runtime: Any, tr_id: int, event_time: Any) -> tuple[Any, Any, str]:
-    """Первая плановая остановка по tr_id в окне (T+600, T+900].
-
-    Возвращает (target_stop_id, target_time_begin, status), где status:
-      "ok" — цель в горизонте, можно прогнозировать;
-      "no_schedule" — tr_id нет в расписании;
-      "no_time" — время события отсутствует/не парсится, окно не проверить;
-      "out_of_horizon" — в окне остановок нет (ближайшая через <600с или
-        только дальние >900с): цель OOD, прогноз не выдаём.
-    """
-    try:
-        import pandas as pd
-
-        schedule = runtime.schedule
-        frame = schedule[pd.to_numeric(schedule["tr_id"], errors="coerce") == tr_id].copy()
-        if frame.empty:
-            return None, None, "no_schedule"
-        frame["time_begin"] = pd.to_datetime(frame["time_begin"], errors="coerce")
-        frame = frame.dropna(subset=["time_begin"]).sort_values("time_begin", kind="stable")
-        if frame.empty:
-            return None, None, "no_schedule"
-        ref = pd.to_datetime(event_time, errors="coerce") if event_time is not None else None
-        if ref is None or pd.isna(ref):
-            return None, None, "no_time"
-        window = frame[
-            (frame["time_begin"] > ref + pd.Timedelta(seconds=LIVE_TARGET_MIN_S))
-            & (frame["time_begin"] <= ref + pd.Timedelta(seconds=LIVE_TARGET_MAX_S))
-        ]
-        if window.empty:
-            return None, None, "out_of_horizon"
-        row = window.iloc[0]
-        target_id = row.get("tt_action_item_id")
-        try:
-            target_id = int(target_id)
-        except (TypeError, ValueError):
-            return None, None, "no_schedule"
-        target_time = row.get("time_begin")
-        if pd.isna(target_time):
-            return None, None, "no_schedule"
-        return target_id, target_time, "ok"
-    except Exception:
-        return None, None, "no_model"
+# --------------------------------------------------------------------------- #
+# Обработчики
+# --------------------------------------------------------------------------- #
 
 
 @app.exception_handler(404)
@@ -484,9 +576,10 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
+async def health() -> dict[str, Any]:
+    """Healthcheck: must stay cheap, so nothing heavy is warmed up here."""
     try:
-        runtime = _get_runtime()
+        runtime = await asyncio.to_thread(_get_runtime)
         return {
             "status": "ok",
             "model": str(runtime.model_path),
@@ -499,27 +592,45 @@ def health() -> dict[str, Any]:
 
 @app.post("/predict")
 async def predict(payload: Annotated[Any, Body()]) -> dict[str, Any]:
+    """Batch prediction endpoint.
+
+    The request is parsed on the event loop (pure CPU, microseconds), then the
+    actual inference is handed to the :class:`MicroBatcher`, which runs it in a
+    worker thread and coalesces it with any concurrent request.  Nothing here
+    blocks the loop.
+    """
     request = _parse_request(payload)
     point_rows = [_dump(point) for point in request.points]
     telemetry_rows = [_dump(event) for event in request.telemetry]
+    started = time.perf_counter()
     try:
-        predictions = await asyncio.to_thread(
-            _get_runtime().predict_records,
-            point_rows,
-            telemetry_rows,
-        )
+        batcher = await _get_batcher()
+        predictions = await batcher.predict_records(point_rows, telemetry_rows or None)
+    except HTTPException:
+        raise
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    METRICS.observe_inference(time.perf_counter() - started, len(point_rows))
     return {"count": len(predictions), "predictions": predictions}
 
 
 @app.post("/generate_submission")
 async def generate_submission() -> dict[str, Any]:
+    batcher = await _get_batcher()
+    started = time.perf_counter()
     try:
-        result = await asyncio.to_thread(_get_runtime().generate_submission)
+        result = await batcher.predict_records(
+            _get_runtime().points.to_dict("records"),
+            _get_runtime().traffic,
+            bypass=True,
+        )
+        payload = _build_submission(result)
     except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return result
+    METRICS.observe_inference(time.perf_counter() - started, len(result))
+    return payload
 
 
 @app.get("/generate_submission")
@@ -527,11 +638,44 @@ async def generate_submission_get() -> dict[str, Any]:
     return await generate_submission()
 
 
+def _build_submission(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate coverage and write submission.csv from already-computed records."""
+    import pandas as pd
+
+    runtime = _get_runtime()
+    expected = runtime.points["sample_id"].astype(str)
+    actual = pd.Series([str(record.get("sample_id")) for record in records], dtype=str)
+    if len(records) != len(runtime.points):
+        raise ValueError("submission coverage mismatch")
+    if actual.duplicated().any() or not actual.equals(expected.reset_index(drop=True)):
+        raise ValueError("submission sample_id coverage mismatch")
+    values = [float(record.get("prediction")) for record in records]
+    if any(not (value == value) or value in (float("inf"), float("-inf")) for value in values):
+        raise ValueError("submission contains non-finite predictions")
+    destination = runtime.root / "submission.csv"
+    frame = pd.DataFrame({"sample_id": actual, "prediction": values})
+    frame.to_csv(destination, index=False, sep=";", float_format="%.6f")
+    return {
+        "path": str(destination),
+        "rows": len(frame),
+        "first_rows": [
+            {"sample_id": str(row["sample_id"]), "prediction": float(row["prediction"])}
+            for _, row in frame.head(5).iterrows()
+        ],
+    }
+
+
 @app.get("/stream/status")
 async def stream_status(
     speed: float | None = Query(default=None, gt=0),
     reset: bool = Query(default=False),
 ) -> dict[str, Any]:
+    """Replay dashboard feed.
+
+    The simulator does its work in a background task; this handler only reads
+    the already-computed state, so the loop is never held for more than the
+    status assembly itself.
+    """
     simulator = await _get_simulator()
     try:
         if reset:
@@ -542,6 +686,7 @@ async def stream_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     data = simulator.status()
     data["live_units"] = await _live_units()
+    data["batching"] = (await _get_batcher()).stats.as_dict()
     return data
 
 
@@ -562,8 +707,8 @@ async def cascade() -> dict[str, Any]:
     them get dragged further behind by an intersecting route, and the per-route
     ETA projection with the stop at which the fleet claws the delay back.
     """
-    runtime = _get_runtime()
-    engine = runtime.cascade_engine()
+    runtime = await asyncio.to_thread(_get_runtime)
+    engine = await asyncio.to_thread(runtime.cascade_engine)
     payload: dict[str, Any] = {"graph": engine.graph.network(), "view": None}
     simulator = getattr(app.state, "simulator", None)
     if simulator is not None:
@@ -574,8 +719,34 @@ async def cascade() -> dict[str, Any]:
     return payload
 
 
+@app.get("/metrics")
+async def metrics() -> dict[str, Any]:
+    """Runtime counters: per-endpoint latency, inference time, batching efficiency."""
+    payload = await METRICS.snapshot()
+    try:
+        payload["batching"] = (await _get_batcher()).stats.as_dict()
+    except Exception:  # noqa: BLE001
+        payload["batching"] = None
+    runtime = getattr(app.state, "runtime", None)
+    if runtime is not None:
+        payload["model"] = {
+            "path": str(runtime.model_path),
+            "features": len(runtime.features),
+            "traffic_rows": int(len(runtime.traffic)),
+            "schedule_rows": int(len(runtime.schedule)),
+            "predict_points": int(len(runtime.points)),
+        }
+    return payload
+
+
+# --------------------------------------------------------------------------- #
+# Жизненный цикл
+# --------------------------------------------------------------------------- #
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
+    await _get_batcher()
     await _get_simulator()
     try:
         receiver = NDTPReceiver(tr_map=_unit_tr_map())
@@ -588,6 +759,10 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    with contextlib.suppress(Exception):
+        batcher = getattr(app.state, "batcher", None)
+        if batcher is not None:
+            await batcher.stop()
     simulator = getattr(app.state, "simulator", None)
     if simulator is not None:
         await simulator.stop()

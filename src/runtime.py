@@ -17,6 +17,7 @@ from catboost import CatBoostRegressor
 
 from src.predictor import build_features_from_frames, haversine_km, parse_point_wkt
 from src.predictor import predict as model_predict
+from src.predictor import schedule_index
 from src.patterns import detect_all
 from src.cascade import CascadeConfig, CascadeEngine
 
@@ -72,6 +73,12 @@ RISK_COLORS = {"on-time": "#22c55e", "at-risk": "#eab308", "late": "#ef4444"}
 # Fed into the cascade as a local source so the forward projection keeps
 # regenerating delay the way a boarding surge actually does.
 CASCADE_DWELL_OVERRUN_S = 30.0
+
+#: Target window for live units, mirroring the horizon the model was trained on
+#: (``lead_minus_660 = lead_s - 660`` in the feature list).  Used by the live
+#: target search and kept here so the service and the cascade agree.
+LIVE_TARGET_MIN_S = 600
+LIVE_TARGET_MAX_S = 900
 
 CAUSE_LABELS = {
     "stale": "телеметрия недостоверна (простой потока или потеря GPS)",
@@ -153,7 +160,41 @@ def _empty_traffic() -> pd.DataFrame:
     return pd.DataFrame(columns=TELEMETRY_COLUMNS)
 
 
-def _normalise_telemetry(traffic: pd.DataFrame | Iterable[dict[str, Any]] | None) -> pd.DataFrame:
+def _ensure_datetime(series: pd.Series) -> pd.Series:
+    """Parse a datetime column only when it is not already one.
+
+    ``pd.to_datetime`` on a 100k-row string column costs ~150 ms and was being
+    redone on every request for data that never changes.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    return pd.to_datetime(series, errors="coerce")
+
+
+def _ensure_numeric(series: pd.Series) -> pd.Series:
+    """Coerce a column to numeric only when it is not already numeric."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _normalise_telemetry(
+    traffic: pd.DataFrame | Iterable[dict[str, Any]] | None,
+    *,
+    already_sorted: bool = False,
+) -> pd.DataFrame:
+    """Coerce arbitrary telemetry into the canonical, causal-ready frame.
+
+    The result is the single representation every downstream stage expects:
+    typed columns, ``tr_id`` as int64, ``event_time`` as datetime64, sorted by
+    ``event_time``.  Pass ``already_sorted=True`` when the caller appends to a
+    frame that is already normalised and sorted (the replay simulator does), and
+    the redundant sort is skipped.
+
+    ``NaT`` timestamps are dropped here rather than downstream: a row with an
+    unparseable ``event_time`` can never pass the ``event_time <= T`` cut, so
+    keeping it only inflates the frame and the window scans.
+    """
     if traffic is None:
         return _empty_traffic()
     frame = traffic.copy() if isinstance(traffic, pd.DataFrame) else pd.DataFrame(list(traffic))
@@ -162,21 +203,24 @@ def _normalise_telemetry(traffic: pd.DataFrame | Iterable[dict[str, Any]] | None
     for column in TELEMETRY_COLUMNS:
         if column not in frame.columns:
             frame[column] = np.nan
-    frame["tr_id"] = pd.to_numeric(frame["tr_id"], errors="coerce")
+    frame["tr_id"] = _ensure_numeric(frame["tr_id"])
     frame = frame.dropna(subset=["tr_id"])
-    frame["tr_id"] = frame["tr_id"].astype(int)
-    frame["event_time"] = pd.to_datetime(frame["event_time"], errors="coerce")
+    frame["tr_id"] = frame["tr_id"].astype("int64")
+    frame["event_time"] = _ensure_datetime(frame["event_time"])
     frame = frame.dropna(subset=["event_time"])
-    frame["speed"] = pd.to_numeric(frame["speed"], errors="coerce")
-    frame["lon"] = pd.to_numeric(frame["lon"], errors="coerce")
-    frame["lat"] = pd.to_numeric(frame["lat"], errors="coerce")
+    frame["speed"] = _ensure_numeric(frame["speed"])
+    frame["lon"] = _ensure_numeric(frame["lon"])
+    frame["lat"] = _ensure_numeric(frame["lat"])
     if frame["location_valid"].dtype == object:
         frame["location_valid"] = frame["location_valid"].astype(str).str.lower().isin(
             {"true", "1", "yes"}
         )
     else:
         frame["location_valid"] = frame["location_valid"].fillna(False).astype(bool)
-    return frame[TELEMETRY_COLUMNS].sort_values("event_time", kind="stable").reset_index(drop=True)
+    frame = frame[TELEMETRY_COLUMNS]
+    if already_sorted:
+        return frame.reset_index(drop=True)
+    return frame.sort_values("event_time", kind="stable").reset_index(drop=True)
 
 
 def _normalise_points(points: pd.DataFrame | Iterable[dict[str, Any]]) -> pd.DataFrame:
@@ -241,6 +285,64 @@ def _record_for_response(row: pd.Series) -> dict[str, Any]:
     }
 
 
+def _append_sorted(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate two event_time-sorted telemetry frames cheaply.
+
+    Both inputs come from the replay simulator in chronological order, so the
+    common case is a plain append; a real sort is only paid when a chunk starts
+    earlier than the buffer tail (clock skew, out-of-order emulator frames).
+    """
+    if left is None or len(left) == 0:
+        return right.reset_index(drop=True)
+    if right is None or len(right) == 0:
+        return left
+    if right["event_time"].iloc[0] >= left["event_time"].iloc[-1]:
+        merged = pd.concat([left, right], ignore_index=True)
+    else:
+        merged = pd.concat([left, right], ignore_index=True).sort_values(
+            "event_time", kind="stable"
+        )
+    return merged.reset_index(drop=True)
+
+
+def _safe_int(value: Any, default: int = -1) -> int:
+    """Best-effort int coercion that never raises (live units may send junk)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _empty_schedule() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["tr_id", "tt_action_item_id", "time_begin", "stop_lon", "stop_lat", "stop_idx"]
+    )
+
+
+def _build_live_target_index(schedule: pd.DataFrame) -> dict[int, dict[str, Any]]:
+    """Pre-index planned arrivals per vehicle as sorted numpy arrays.
+
+    The live endpoint used to filter and re-sort the whole 5 558-row schedule
+    with pandas for *every connected unit on every request* -- ~1.5 ms per unit,
+    so ~45 ms for a 30-bus fleet, all of it repeated work.  With per-vehicle
+    ``int64`` nanosecond arrays the same lookup is a ``searchsorted``.
+    """
+    index: dict[int, dict[str, Any]] = {}
+    if schedule is None or len(schedule) == 0:
+        return index
+    frame = schedule[["tr_id", "tt_action_item_id", "time_begin"]].copy()
+    frame = frame.dropna(subset=["time_begin", "tt_action_item_id"])
+    for tr_id, group in frame.groupby("tr_id", sort=False):
+        times = group["time_begin"].to_numpy(dtype="datetime64[ns]").astype("int64")
+        stops = group["tt_action_item_id"].to_numpy(dtype="int64")
+        order = np.argsort(times, kind="stable")
+        index[int(tr_id)] = {
+            "times_ns": np.ascontiguousarray(times[order]),
+            "stops": np.ascontiguousarray(stops[order]),
+        }
+    return index
+
+
 class InferenceService:
     def __init__(
         self,
@@ -267,6 +369,14 @@ class InferenceService:
         if not isinstance(self.features, list) or not self.features:
             raise ValueError(f"invalid feature list: {self.features_path}")
         self.prob_cal = self._load_prob_cal(self.root / "ml" / "prob_cal.json")
+        # Normalise the static telemetry once. The normalised frame *replaces*
+        # the raw read rather than sitting next to it, so this costs no extra
+        # resident memory and removes ~150 ms of parsing from every request.
+        self.traffic = _normalise_telemetry(self.traffic)
+        # Static timetable view (WKT parsing, sorting, inter-stop geometry) is
+        # likewise derived once and memoised for the whole process.
+        self.schedule_index = schedule_index(self.schedule)
+        self._live_target_index = _build_live_target_index(self.schedule_index.prepared)
         # Cascading-delay engine. The graph (one vertex per planned stop-visit
         # plus corridor transfer links) is built lazily on first use, because it
         # costs ~1-2 s on a full extract and /health must not pay for it.
@@ -328,9 +438,22 @@ class InferenceService:
         points: pd.DataFrame | Iterable[dict[str, Any]],
         traffic: pd.DataFrame | Iterable[dict[str, Any]] | None = None,
     ) -> pd.DataFrame:
+        """Predict for a set of points and post-process the model output.
+
+        Batching note: passing many points with different ``T`` is *safe* and
+        is the intended usage.  The causal cut is applied per point inside
+        :func:`src.predictor._vehicle_telemetry_features` via
+        ``searchsorted(times, T, 'right')``; the ``max_time`` filter below is
+        only a coarse pre-trim to the largest ``T`` in the batch.  Equivalence
+        between single-row and batched prediction is asserted in
+        ``ml/test_batching.py`` (max abs difference 0.0).
+        """
         point_frame = _normalise_points(points)
-        source_traffic = self.traffic if traffic is None else traffic
-        telemetry = _normalise_telemetry(source_traffic)
+        if traffic is None:
+            # Fast path: the service's telemetry is already normalised and sorted.
+            telemetry = self.traffic
+        else:
+            telemetry = _normalise_telemetry(traffic)
         max_time = point_frame["T"].max()
         ids = set(point_frame["tr_id"].tolist())
         causal_traffic = telemetry[
@@ -340,6 +463,7 @@ class InferenceService:
             point_frame,
             causal_traffic,
             self.schedule,
+            self.schedule_index,
         )
         values = np.asarray(model_predict(self.model, features_frame, self.features), dtype=float)
         if len(values) != len(point_frame) or not np.isfinite(values).all():
@@ -362,6 +486,36 @@ class InferenceService:
             pattern_events.append(events)
         result["pattern_events"] = pattern_events
         return result
+
+    def live_target(self, tr_id: int, event_time: Any) -> tuple[Any, Any, str]:
+        """First planned stop whose arrival falls in ``(T+600, T+900]``.
+
+        O(log n) per call: binary search on the pre-indexed arrival times of the
+        vehicle.  Mirrors the previous pandas implementation exactly, including
+        the ``no_schedule`` / ``no_time`` / ``out_of_horizon`` statuses that the
+        live UI renders verbatim.
+        """
+        entry = self._live_target_index.get(_safe_int(tr_id))
+        if entry is None:
+            return None, None, "no_schedule"
+        try:
+            reference = pd.to_datetime(pd.Timestamp(event_time).tz_localize(None) if pd.Timestamp(event_time).tzinfo else pd.Timestamp(event_time))
+        except (TypeError, ValueError):
+            return None, None, "no_time"
+        if reference is None or pd.isna(reference):
+            return None, None, "no_time"
+        times = entry["times_ns"]
+        reference_ns = int(reference.value)
+        start = int(np.searchsorted(times, reference_ns + LIVE_TARGET_MIN_S * 1_000_000_000, side="right"))
+        stop = int(np.searchsorted(times, reference_ns + LIVE_TARGET_MAX_S * 1_000_000_000, side="right"))
+        if stop <= start:
+            return None, None, "out_of_horizon"
+        target_id = int(entry["stops"][start])
+        return target_id, pd.Timestamp(times[start]), "ok"
+
+    def schedule_for(self, tr_id: int) -> pd.DataFrame:
+        """Planned timetable of one vehicle, from the pre-computed index."""
+        return self.schedule_index.by_vehicle.get(_safe_int(tr_id), _empty_schedule())
 
     def _eta_projection(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         """Forward ETA projection of one prediction along its own route.
@@ -521,6 +675,10 @@ class StreamSimulator:
         self._vehicles: dict[int, dict[str, Any]] = {}
         self._vehicle_telemetry: dict[int, list[dict[str, Any]]] = {}
         self._visible_traffic: list[dict[str, Any]] = []
+        # Normalised mirror of ``_visible_traffic``, extended incrementally so
+        # the replay loop never re-parses the whole frame.
+        self._normalised_traffic: pd.DataFrame | None = None
+        self._normalised_upto: int = 0
         self._routes = _route_network(service.schedule)
         self.speed = self._safe_speed(speed)
         self._reset_state()
@@ -556,6 +714,8 @@ class StreamSimulator:
         self._traffic_position = 0
         self._point_position = 0
         self._visible_traffic = []
+        self._normalised_traffic = None
+        self._normalised_upto = 0
         self._vehicle_telemetry = {}
         self._vehicles = {}
         if hasattr(self, "_cascade"):
@@ -608,14 +768,14 @@ class StreamSimulator:
         ]
 
     def _vehicle_schedule(self, vehicle_id: int) -> pd.DataFrame:
-        schedule = self.service.schedule.copy()
-        schedule["tr_id"] = pd.to_numeric(schedule["tr_id"], errors="coerce")
-        schedule = schedule[schedule["tr_id"] == vehicle_id].copy()
-        schedule["time_begin"] = pd.to_datetime(schedule["time_begin"], errors="coerce")
-        parsed = schedule["geom"].map(parse_point_wkt)
-        schedule["lon"] = [value[0] for value in parsed]
-        schedule["lat"] = [value[1] for value in parsed]
-        return schedule.sort_values(["time_begin", "tt_action_item_id"], kind="stable")
+        """Planned timetable of one vehicle.
+
+        Delegates to the service's pre-computed schedule index, which already
+        holds the parsed coordinates and is sorted by plan time.  The previous
+        implementation copied and re-sorted the full 5 558-row schedule for
+        *every* forecast point.
+        """
+        return self.service.schedule_for(vehicle_id)
 
     @staticmethod
     def _stop_card(row: pd.Series | None) -> dict[str, Any] | None:
@@ -733,27 +893,66 @@ class StreamSimulator:
         }
 
     def advance_to(self, target_time: pd.Timestamp) -> None:
+        """Advance the replay clock, ingesting telemetry and scoring points.
+
+        Forecast points that fall due in the same tick are scored in **one
+        batch** rather than one call per point.  That is the single largest
+        latency win in the replay path: feature building carries a large fixed
+        cost per call (schedule lookup, telemetry slicing, dataframe merge), so
+        a 10-point tick costs about the same as a 1-point tick.  The batch is
+        causally sound because the per-point ``event_time <= T`` cut happens
+        inside the feature builder, not here.
+        """
         target = pd.Timestamp(target_time)
+        appended = False
         while self._traffic_position < len(self._traffic_rows):
             event_time = pd.Timestamp(self._traffic_rows[self._traffic_position]["event_time"])
             if event_time > target:
                 break
             self._remember_telemetry(self._traffic_rows[self._traffic_position])
             self._traffic_position += 1
+            appended = True
+        if appended:
+            # Append only the new rows to the already-normalised buffer: no
+            # re-parse, no re-sort of the 100k-row frame.
+            new_rows = self._visible_traffic[self._normalised_upto :]
+            if new_rows:
+                chunk = _normalise_telemetry(new_rows)
+                self._normalised_traffic = (
+                    chunk
+                    if self._normalised_traffic is None
+                    else _append_sorted(self._normalised_traffic, chunk)
+                )
+                self._normalised_upto = len(self._visible_traffic)
+
+        due: list[dict[str, Any]] = []
         while self._point_position < len(self._point_rows):
             point = self._point_rows[self._point_position]
             point_time = pd.Timestamp(point["T"])
             if point_time > target:
                 break
-            result = self.service.predict_frame([point], pd.DataFrame(self._visible_traffic))
-            if not result.empty:
-                record = _record_for_response(result.iloc[0])
+            due.append(point)
+            self._point_position += 1
+
+        if due:
+            traffic = (
+                self._normalised_traffic
+                if self._normalised_traffic is not None
+                else _normalise_telemetry(self._visible_traffic)
+            )
+            if traffic is None or len(traffic) == 0:
+                batched = pd.DataFrame()
+            else:
+                batched = self.service.predict_frame(due, traffic)
+            for position, point in enumerate(due):
+                if position >= len(batched):
+                    break
+                record = _record_for_response(batched.iloc[position])
                 events = record.get("pattern_events") or []
                 record["snapshot"] = self._snapshot_for_point(point, events)
                 self._vehicles[int(record["tr_id"])] = record
-                # A new prediction changes the cascade field.
-                self._cascade_dirty = True
-            self._point_position += 1
+            self._cascade_dirty = True
+
         if self._traffic_position >= len(self._traffic_rows) and self._point_position >= len(self._point_rows):
             self.current_time = target
             self.finished = True
