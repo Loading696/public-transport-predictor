@@ -128,7 +128,64 @@ def _latest_position(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
             "heading": _json_value(row.get("heading")),
         }
     return None
+    
 
+def _project_to_segment(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float
+) -> tuple[float, float, float]:
+    """Closest point to ``(px, py)`` on segment ``[(ax, ay), (bx, by)]``.
+
+    Plain 2-D vector projection, clamped to the segment ends. Returns the
+    projected point and its Euclidean distance from ``(px, py)`` in whatever
+    unit the inputs are in.
+    """
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq <= 0:
+        t = 0.0
+    else:
+        t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+        t = min(1.0, max(0.0, t))
+    qx, qy = ax + t * dx, ay + t * dy
+    return qx, qy, math.hypot(px - qx, py - qy)
+
+
+def snap_to_polyline(
+    lon: float | None, lat: float | None, polyline: list[list[float]]
+) -> dict[str, float] | None:
+    """Snap a raw GPS fix onto the nearest segment of the planned route.
+
+    Deliberately the simplest map matching that is still correct: no road
+    graph, no OSRM, no NDTP-specific logic -- the planned route already *is*
+    a sequence of stops (``ScheduleIndex`` / ``_route_network``), so the fix
+    is just projected onto every consecutive pair of stops and the closest
+    projection wins. Coordinates are treated as locally planar
+    (equirectangular around the route's own latitude), which is accurate to
+    a few metres at city scale and avoids pulling in a routing engine for a
+    hackathon demo. ``polyline`` entries are ``[lat, lon]`` to match the
+    ``status()`` route polyline already built for the map.
+    """
+    if lon is None or lat is None or not polyline or len(polyline) < 2:
+        return None
+    lat0 = math.radians(polyline[len(polyline) // 2][0])
+    km_per_deg_lat = 111.32
+    km_per_deg_lon = 111.32 * math.cos(lat0) or 1e-9
+    px, py = lon * km_per_deg_lon, lat * km_per_deg_lat
+    best: tuple[float, float, float] | None = None
+    for (alat, alon), (blat, blon) in zip(polyline[:-1], polyline[1:]):
+        qx, qy, dist_km = _project_to_segment(
+            px, py, alon * km_per_deg_lon, alat * km_per_deg_lat, blon * km_per_deg_lon, blat * km_per_deg_lat
+        )
+        if best is None or dist_km < best[2]:
+            best = (qx, qy, dist_km)
+    if best is None:
+        return None
+    qx, qy, dist_km = best
+    return {
+        "lon": qx / km_per_deg_lon,
+        "lat": qy / km_per_deg_lat,
+        "snap_distance_m": dist_km * 1000.0,
+    }
 
 def _route_network(schedule: pd.DataFrame) -> dict[int, dict[str, Any]]:
     frame = schedule.copy()
@@ -987,6 +1044,7 @@ class StreamSimulator:
         for vehicle_id in sorted(self._vehicles):
             route = self._routes.get(vehicle_id)
             risk = str(self._vehicles[vehicle_id].get("risk", "on-time"))
+            polyline: list[list[float]] = []
             if route is not None:
                 polyline = [
                     [stop["lat"], stop["lon"]]
@@ -1004,7 +1062,23 @@ class StreamSimulator:
                 )
             position = _latest_position(self._vehicle_telemetry.get(vehicle_id, []))
             if position is not None:
-                active_positions.append({"tr_id": vehicle_id, "risk": risk, **position})
+                # Map matching: snap the raw GPS fix onto the nearest leg of
+                # the planned route before it reaches the dashboard, so
+                # markers sit on the road/route instead of drifting off it
+                # with GPS noise. Raw coordinates are kept as raw_lon/raw_lat
+                # for anyone who wants the unmatched fix.
+                matched = snap_to_polyline(position.get("lon"), position.get("lat"), polyline)
+                entry = {"tr_id": vehicle_id, "risk": risk, **position}
+                if matched is not None:
+                    entry["raw_lon"] = position.get("lon")
+                    entry["raw_lat"] = position.get("lat")
+                    entry["lon"] = matched["lon"]
+                    entry["lat"] = matched["lat"]
+                    entry["snap_distance_m"] = matched["snap_distance_m"]
+                    entry["map_matched"] = True
+                else:
+                    entry["map_matched"] = False
+                active_positions.append(entry)
         return {
             "simulated_time": _json_value(self.current_time),
             "speed": self.speed,
