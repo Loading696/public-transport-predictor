@@ -1,0 +1,142 @@
+# Three services, one direction of dependency:
+#
+#   dashboard  -->  backend  -->  ml
+#
+# The backend reaches the ML service at http://ml:8001 -- the container name,
+# resolved by Docker's embedded DNS. Nothing dials localhost for a service in
+# another container, and the backend does not depend on the dashboard.
+#
+# Self-containment
+# ----------------
+# No service bind-mounts the repository. Every container runs entirely from its
+# own image plus the named volumes declared here, so `docker compose up` behaves
+# identically on a clean checkout, in CI and on a laptop.
+#
+# In particular the backend does NOT see ml/model.cbm, ml/features.json or
+# ml/prob_cal.json: those exist only inside the `ml` image. A stray file in the
+# host's ml/ directory cannot make the backend "work" by accident, and cannot
+# make it start failing when it is deleted.
+#
+# ML artifacts, one place:
+#   /app/ml/model.cbm      in the `ml` image only
+#   /app/ml/features.json  in the `ml` image only
+#   /app/ml/prob_cal.json  in the `ml` image only
+#   training inputs (dataset/train,test,labels)  not in any image; mounted only
+#                                                into the one-shot training job
+
+services:
+  # Feature engineering + CatBoost inference. The only container with the model.
+  ml:
+    build:
+      context: .
+      dockerfile: ./ml-service/Dockerfile
+    environment:
+      MODEL_PATH: /app/ml/model.cbm
+      FEATURES_PATH: /app/ml/features.json
+      PROB_CAL_PATH: /app/ml/prob_cal.json
+      SCHEDULE_PATH: /app/dataset/validate/schedule_plan.csv
+      ML_PORT: "8001"
+      ML_MAX_BATCH_ROWS: "${ML_MAX_BATCH_ROWS:-512}"
+    # Internal only: no host port. The backend is the sole consumer, and a
+    # published port would let a second stack collide on it during a demo.
+    expose:
+      - "8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, os, sys, urllib.request
+          url = "http://127.0.0.1:" + os.environ.get("ML_PORT", "8001") + "/health"
+          sys.exit(0 if json.load(urllib.request.urlopen(url, timeout=4)).get("status") == "ok" else 1)
+      interval: 10s
+      timeout: 6s
+      # The model and the schedule index load at start-up; do not judge it before.
+      start_period: 40s
+      retries: 12
+    restart: unless-stopped
+
+  # API, NDTP receiver, replay stream, cascade. Talks to `ml` by name.
+  backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    ports:
+      - "8000:8000"
+      - "9201:9201"
+    environment:
+      DATASET_DIR: /app/dataset
+      SIMULATION_SPEED: "${SIMULATION_SPEED:-60}"
+      TCP_PORT: "9201"
+      # Service discovery by container name, not localhost.
+      ML_SERVICE_URL: http://ml:8001
+      ML_TIMEOUT_S: "${ML_TIMEOUT_S:-10}"
+      ML_CONNECT_TIMEOUT_S: "${ML_CONNECT_TIMEOUT_S:-2}"
+      ML_FAILURE_THRESHOLD: "${ML_FAILURE_THRESHOLD:-3}"
+      ML_COOLDOWN_S: "${ML_COOLDOWN_S:-10}"
+      # submission.csv lands on a named volume, not in the container's
+      # writable layer, so it survives a recreate and can be collected with
+      #   docker compose cp backend:/app/out/submission.csv ./submission.csv
+      SUBMISSION_PATH: /app/out/submission.csv
+    volumes:
+      - submissions:/app/out
+    depends_on:
+      ml:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          h = json.load(urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=4))
+          # 'degraded' is a serving backend with an unreachable ML service; it
+          # must not be restarted in a loop.
+          sys.exit(0 if h.get("status") in ("ok", "degraded") else 1)
+      interval: 10s
+      timeout: 6s
+      start_period: 25s
+      retries: 6
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./dashboard/Dockerfile
+      args:
+        VITE_API_BASE: /api
+        VITE_MAP_PROVIDER: "${VITE_MAP_PROVIDER:-2gis}"
+        VITE_TWOGIS_API_KEY: "${VITE_TWOGIS_API_KEY:-}"
+        VITE_TWOGIS_LOCALE: "${VITE_TWOGIS_LOCALE:-ru_RU}"
+        VITE_YANDEX_API_KEY: "${VITE_YANDEX_API_KEY:-}"
+        VITE_GOOGLE_MAPS_API_KEY: "${VITE_GOOGLE_MAPS_API_KEY:-}"
+        VITE_DEFAULT_CENTER: "${VITE_DEFAULT_CENTER:-55.7558,37.6173}"
+        VITE_DEFAULT_ZOOM: "${VITE_DEFAULT_ZOOM:-11}"
+        VITE_POLL_INTERVAL_MS: "${VITE_POLL_INTERVAL_MS:-3000}"
+        VITE_WS_URL: "${VITE_WS_URL:-}"
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Живой эмулятор NDTP: образ подгружается вручную
+  #   docker load -i dataset/ndtp-telemetry-emulator.tar
+  # конфиг шлется отдельно: POST http://localhost:18080/api/config (см. ndtp-emu-config.json).
+  # Профиль: docker compose --profile emu up
+  ndtp-emu:
+    image: "ndtp-telemetry-emulator:1.0"
+    profiles: ["emu"]
+    ports:
+      - "18080:18080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+volumes:
+  # Generated artifact from /generate_submission. Named so it is not tied to a
+  # host path and survives `docker compose down` (not `down -v`).
+  submissions:

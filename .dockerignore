@@ -1,0 +1,49 @@
+# Build context allow-list.
+#
+# Both service images COPY from this tree, so anything listed here is invisible
+# to the build. The rules that matter: the training split must never reach a
+# production image, and local build noise must not bloat the context.
+
+# --- training data: never in any image ------------------------------------- #
+dataset/ndtp-telemetry-emulator.tar
+dataset/labels/
+dataset/train/
+dataset/test/
+dataset/docs/
+# Patterns, in case a split lands somewhere other than the three above.
+**/labels/
+**/train/
+**/test/
+
+# --- local build noise ----------------------------------------------------- #
+.git
+.github
+.idea
+.vscode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# node
+node_modules
+**/node_modules
+dashboard/dist
+dist
+
+# docs build output
+docs/_build/
+
+# generated artifacts: rebuilt inside the images from source + data
+submission.csv
+**/submission.csv
+
+# secrets and local overrides
+.env
+**/.env
+**/.env.local
+**/.env.*.local
+
+# training scratch
+out/

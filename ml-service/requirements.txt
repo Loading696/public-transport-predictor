@@ -1,0 +1,11 @@
+# Dependencies of the ML service only.  Note what is absent: no CatBoost in the
+# backend image, and no httpx here.  The split is the point -- each container
+# installs what it actually uses, so an accidental import across the boundary
+# fails loudly instead of silently working.
+catboost>=1.2
+fastapi>=0.110.0
+uvicorn>=0.28.0
+numpy>=1.26.0
+pandas>=2.0.0
+polars>=1.0.0
+scikit-learn>=1.4.0

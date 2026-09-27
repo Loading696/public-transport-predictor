@@ -1,0 +1,11 @@
+# Dependencies of the backend only.
+#
+# There is deliberately no catboost and no scikit-learn here: the model lives in
+# the ML service.  If a backend module ever needs them, that is a design signal
+# that work has leaked across the service boundary.
+fastapi>=0.110.0
+uvicorn>=0.28.0
+httpx>=0.27.0
+numpy>=1.26.0
+pandas>=2.0.0
+polars>=1.0.0
